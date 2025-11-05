@@ -8,7 +8,9 @@
 
 ## 실행 방법
 
-> ⚠️ **중요:** 키움증권 OpenAPI+는 Windows 환경에서만 ActiveX 컨트롤을 통해 동작합니다. 따라서 Windows + Python 3.9~3.11(32비트) 환경에서 실행해야 하며, 키움 OpenAPI가 설치되어 있어야 합니다. (64비트 Python에서는 ActiveX 컨트롤이 로드되지 않습니다.)
+
+> ⚠️ **중요:** 키움증권 OpenAPI+는 Windows 환경에서만 ActiveX 컨트롤을 통해 동작합니다. 따라서 Windows + Python 3.9~3.11 환경에서 실행해야 하며, 키움 OpenAPI가 설치되어 있어야 합니다.
+
 
 1. PyQt5 및 필요 라이브러리 설치
 
@@ -21,6 +23,7 @@ pip install pyqt5
 ```bash
 python stage1_basic_test/main.py
 ```
+
 
 3. 로그인 전에 개인 API 코드(또는 계좌 비밀번호)를 입력한 뒤 로그인 버튼을 눌러 키움증권 계정에 로그인합니다.
 4. 계좌 조회 버튼으로 선택된 계좌의 잔액 정보를 확인합니다.

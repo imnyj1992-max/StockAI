@@ -77,6 +77,7 @@ class KiwoomOpenApiWidget(QAxWidget):
         self.account_info: Dict[str, Dict[str, str]] = {}
         self.api_code: str = ""
 
+
     # ------------------------------------------------------------------
     # Login handling
     # ------------------------------------------------------------------
@@ -102,7 +103,6 @@ class KiwoomOpenApiWidget(QAxWidget):
             )
         except Exception:
             pass
-
     def _on_login(self, err_code: int) -> None:
         if self.login_event_loop is None:
             return
