@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from PyQt5.QtCore import QEventLoop, Qt
+from PyQt5.QtCore import QCoreApplication, QEventLoop, Qt
 from PyQt5.QtWidgets import (
     QApplication,
     QLabel,
@@ -53,15 +53,30 @@ class KiwoomOpenApiWidget(QAxWidget):
     """Wrapper around the Kiwoom OpenAPI ActiveX control."""
 
     def __init__(self) -> None:
-        super().__init__("KHOPENAPI.KHOpenAPICtrl.1")
+        super().__init__()
+
+        if not self.setControl("KHOPENAPI.KHOpenAPICtrl.1"):
+            raise RuntimeError(
+                "Kiwoom OpenAPI+ 컨트롤을 불러오지 못했습니다. "
+                "키움 OpenAPI+가 설치되어 있고 32비트 Python 환경에서 실행 중인지 확인해주세요."
+            )
+
         self.login_event_loop: Optional[QEventLoop] = None
         self.comm_event_loop: Optional[QEventLoop] = None
 
-        self.OnEventConnect.connect(self._on_login)
-        self.OnReceiveTrData.connect(self._on_receive_tr_data)
+        try:
+            self.OnEventConnect.connect(self._on_login)
+            self.OnReceiveTrData.connect(self._on_receive_tr_data)
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Kiwoom OpenAPI+ 이벤트를 초기화하지 못했습니다. "
+                "키움 OpenAPI+가 올바르게 설치되었는지 확인해주세요."
+            ) from exc
 
         self.accounts: list[str] = []
         self.account_info: Dict[str, Dict[str, str]] = {}
+        self.api_code: str = ""
+
 
     # ------------------------------------------------------------------
     # Login handling
@@ -71,6 +86,23 @@ class KiwoomOpenApiWidget(QAxWidget):
         self.login_event_loop = QEventLoop()
         self.login_event_loop.exec_()
 
+    def set_personal_api_code(self, api_code: str) -> None:
+        """Store the user-provided API code for later authenticated requests."""
+
+        self.api_code = api_code.strip()
+
+        if not self.api_code:
+            return
+
+        # Some environments expose helper methods for registering the API key.
+        # Because the availability differs by installation, any failure is
+        # silenced so the GUI continues operating with the stored value.
+        try:  # pragma: no cover - depends on native Kiwoom installation
+            self.dynamicCall(
+                "KOA_Functions(QString, QString)", "SetApiKey", self.api_code
+            )
+        except Exception:
+            pass
     def _on_login(self, err_code: int) -> None:
         if self.login_event_loop is None:
             return
@@ -89,7 +121,8 @@ class KiwoomOpenApiWidget(QAxWidget):
 
     def request_account_balance(self, account: str) -> None:
         self.SetInputValue("계좌번호", account)
-        self.SetInputValue("비밀번호", "0000")  # Placeholder: replace with actual password
+        password = self.api_code or "0000"
+        self.SetInputValue("비밀번호", password)
         self.SetInputValue("비밀번호입력매체구분", "00")
         self.SetInputValue("조회구분", "2")
         self.comm_event_loop = QEventLoop()
@@ -141,6 +174,10 @@ class MainWindow(QMainWindow):
         self.resize(480, 360)
 
         self.status_label = QLabel("로그인 상태: 미로그인")
+        self.api_code_label = QLabel("개인 API 코드 (계좌 비밀번호)")
+        self.api_code_input = QLineEdit()
+        self.api_code_input.setPlaceholderText("API 코드 또는 계좌 비밀번호")
+        self.api_code_input.setEchoMode(QLineEdit.Password)
         self.account_input = QLineEdit()
         self.account_input.setPlaceholderText("계좌번호")
         self.account_input.setReadOnly(True)
@@ -157,6 +194,8 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addWidget(self.status_label)
+        layout.addWidget(self.api_code_label)
+        layout.addWidget(self.api_code_input)
         layout.addWidget(self.account_input)
         layout.addWidget(self.login_button)
         layout.addWidget(self.fetch_button)
@@ -167,6 +206,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
     def _login(self) -> None:
+        self.kiwoom.set_personal_api_code(self.api_code_input.text())
         try:
             self.kiwoom.login()
         except Exception as exc:  # pragma: no cover - ActiveX errors on unsupported OS
@@ -213,10 +253,14 @@ class MainWindow(QMainWindow):
 
 
 def run() -> None:
+    QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
-    app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 
-    kiwoom = KiwoomOpenApiWidget()
+    try:
+        kiwoom = KiwoomOpenApiWidget()
+    except RuntimeError as exc:
+        QMessageBox.critical(None, "Kiwoom OpenAPI 오류", str(exc))
+        sys.exit(1)
     window = MainWindow(kiwoom)
     window.show()
 
