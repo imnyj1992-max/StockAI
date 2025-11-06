@@ -1,269 +1,483 @@
-"""Stage 1: Basic Kiwoom OpenAPI login and account information GUI.
-
-This module defines a PyQt5 GUI that performs the following tasks:
-- Initiates a login request through the Kiwoom OpenAPI+ control.
-- Displays the login status to the user.
-- Retrieves the first connected account number and basic account balance information.
-- Presents the fetched account data in a simple GUI.
-
-The code is written to run on Windows where Kiwoom OpenAPI+ is available. On
-other platforms the ActiveX control will not be accessible.
-"""
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import QCoreApplication, QEventLoop, Qt
+import requests
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-from PyQt5.QAxContainer import QAxWidget
+
+
+TRACKED_HEADERS = ["next-key", "cont-yn", "api-id"]
+
+
+def _parse_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip().replace(",", "")
+        if not stripped:
+            return 0.0
+        try:
+            return float(stripped)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _parse_int(value: Any) -> int:
+    return int(round(_parse_float(value)))
 
 
 @dataclass
-class AccountBalance:
-    """Simple container for account balance summary information."""
+class OverseasSummary:
+    krw_estimated_asset: float
+    evaluation_amount: float
+    purchase_amount: float
 
-    account_number: str
-    deposit: str
-    available_funds: str
-    estimated_value: str
 
-    @classmethod
-    def from_raw(cls, account: str, data: Dict[str, str]) -> "AccountBalance":
-        return cls(
-            account_number=account,
-            deposit=data.get("예수금", ""),
-            available_funds=data.get("출금가능금액", ""),
-            estimated_value=data.get("추정예탁자산", ""),
+@dataclass
+class OverseasHolding:
+    symbol: str
+    name: str
+    quantity: float
+    buy_amount: float
+    eval_amount: float
+    average_price: float
+    current_price: float
+
+
+class KiwoomRestClient:
+    """Minimal Kiwoom REST client for account balance TR calls."""
+
+    def __init__(self, *, mode: str = "real") -> None:
+        if mode not in {"real", "mock"}:
+            raise ValueError("mode must be 'real' or 'mock'")
+        self.mode = mode
+        self.host = "https://api.kiwoom.com" if mode == "real" else "https://mockapi.kiwoom.com"
+        self._access_token: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def authenticate(self, appkey: str, secretkey: str) -> str:
+        payload = {
+            "grant_type": "client_credentials",
+            "appkey": appkey,
+            "secretkey": secretkey,
+        }
+        response = self._post("/oauth2/token", payload)
+        if response is None:
+            raise RuntimeError("Token request failed.")
+
+        token = response.get("access_token") or response.get("token") or response.get("accessToken")
+        if not token:
+            raise RuntimeError("Access token missing in response.")
+        self._access_token = token
+        return token
+
+    def fetch_overseas_balance(
+        self,
+        payload: Dict[str, Any],
+        *,
+        endpoint: str,
+        api_id: str,
+        cont_yn: str = "N",
+        next_key: str = "",
+    ) -> Tuple[OverseasSummary, List[OverseasHolding], Dict[str, Any]]:
+        if self.mode == "mock":
+            summary, holdings = self._mock_overseas_balance()
+            return summary, holdings, {
+                "mode": "mock",
+                "summary": summary.__dict__,
+                "holdings": [h.__dict__ for h in holdings],
+            }
+
+        if not self._access_token:
+            raise RuntimeError("No access token. Call authenticate() first.")
+
+        response = self._post(
+            endpoint,
+            payload,
+            token=self._access_token,
+            api_id=api_id,
+            cont_yn=cont_yn,
+            next_key=next_key,
+        )
+        if response is None:
+            raise RuntimeError("Overseas balance request failed.")
+
+        summary, holdings = self._parse_overseas_balance(response)
+        return summary, holdings, response
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _post(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        *,
+        token: Optional[str] = None,
+        api_id: Optional[str] = None,
+        cont_yn: str = "N",
+        next_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        url = self.host + endpoint
+        headers = {"Content-Type": "application/json;charset=UTF-8"}
+
+        if token:
+            headers["authorization"] = f"Bearer {token}"
+            headers["cont-yn"] = cont_yn
+            headers["next-key"] = next_key
+            if api_id:
+                headers["api-id"] = api_id
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"HTTP request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Response is not valid JSON.") from exc
+
+        return body if isinstance(body, dict) else None
+
+    def _parse_overseas_balance(
+        self,
+        payload: Dict[str, Any],
+    ) -> Tuple[OverseasSummary, List[OverseasHolding]]:
+        summary_source = self._find_first_mapping(
+            payload,
+            ["output", "output1", "summary", "data", "result"],
         )
 
+        summary = OverseasSummary(
+            krw_estimated_asset=_parse_float(self._find_first(summary_source, [
+                "krw_estimated_asset",
+                "ovrs_kor_estm_amt",
+                "ovrs_tot_estm_amt",
+                "ovrs_kor_evlt_amt",
+            ])),
+            evaluation_amount=_parse_float(self._find_first(summary_source, [
+                "evaluation_amount",
+                "ovrs_evlt_amt",
+                "ovrs_pdls_amt",
+            ])),
+            purchase_amount=_parse_float(self._find_first(summary_source, [
+                "purchase_amount",
+                "ovrs_buy_amt",
+                "ovrs_pdls_buy_amt",
+            ])),
+        )
 
-class KiwoomOpenApiWidget(QAxWidget):
-    """Wrapper around the Kiwoom OpenAPI ActiveX control."""
+        holdings_source = self._find_first_list(
+            payload,
+            ["output1", "output2", "stocks", "holdings", "items", "result_list"],
+        )
+
+        holdings: List[OverseasHolding] = []
+        for entry in holdings_source:
+            holdings.append(
+                OverseasHolding(
+                    symbol=str(self._find_first(entry, ["symbol", "ovrs_item_cd", "stk_cd", "code"]) or "-").strip(),
+                    name=str(self._find_first(entry, ["name", "ovrs_item_nm", "item_name", "stock_name"]) or "-").strip(),
+                    quantity=_parse_float(self._find_first(entry, ["quantity", "ovrs_cblc_qty", "qty", "hold_qty"])),
+                    buy_amount=_parse_float(self._find_first(entry, ["buy_amount", "ovrs_buamt", "buy_amt", "pchs_amt"])),
+                    eval_amount=_parse_float(self._find_first(entry, ["eval_amount", "ovrs_evlt_amt", "eval_amt", "evlt_amt"])),
+                    average_price=_parse_float(self._find_first(entry, ["average_price", "ovrs_avg_prc", "avg_price", "avg_prc"])),
+                    current_price=_parse_float(self._find_first(entry, ["current_price", "ovrs_now_prc", "prpr", "current_prc"])),
+                )
+            )
+
+        return summary, holdings
+
+    @staticmethod
+    def _find_first_mapping(payload: Dict[str, Any], candidates: List[str]) -> Dict[str, Any]:
+        for key in candidates:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    @staticmethod
+    def _find_first(source: Dict[str, Any] | None, candidates: List[str]) -> Any:
+        if not source:
+            return None
+        for key in candidates:
+            if key in source:
+                return source[key]
+        return None
+
+    @staticmethod
+    def _find_first_list(payload: Dict[str, Any], candidates: List[str]) -> List[Dict[str, Any]]:
+        for key in candidates:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _mock_overseas_balance(self) -> Tuple[OverseasSummary, List[OverseasHolding]]:
+        summary = OverseasSummary(
+            krw_estimated_asset=52_350_000.0,
+            evaluation_amount=49_800_000.0,
+            purchase_amount=45_900_000.0,
+        )
+        holdings = [
+            OverseasHolding(
+                symbol="AAPL",
+                name="Apple",
+                quantity=30,
+                buy_amount=4_500_000.0,
+                eval_amount=5_100_000.0,
+                average_price=150_000.0,
+                current_price=170_000.0,
+            ),
+            OverseasHolding(
+                symbol="TSLA",
+                name="Tesla",
+                quantity=10,
+                buy_amount=7_800_000.0,
+                eval_amount=6_900_000.0,
+                average_price=780_000.0,
+                current_price=690_000.0,
+            ),
+        ]
+        return summary, holdings
+
+
+class Stage1Window(QMainWindow):
+    """GUI for querying overseas balance and holdings through the Kiwoom REST API."""
 
     def __init__(self) -> None:
         super().__init__()
+        self.setWindowTitle("StockAI - Stage 1 Overseas Balance Viewer")
+        self.resize(860, 620)
 
-        if not self.setControl("KHOPENAPI.KHOpenAPICtrl.1"):
-            raise RuntimeError(
-                "Kiwoom OpenAPI+ 컨트롤을 불러오지 못했습니다. "
-                "키움 OpenAPI+가 설치되어 있고 32비트 Python 환경에서 실행 중인지 확인해주세요."
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["real", "mock"])
+        self.mode_combo.currentTextChanged.connect(self._mode_changed)
+
+        self.appkey_input = QLineEdit()
+        self.secret_input = QLineEdit()
+        self.secret_input.setEchoMode(QLineEdit.Password)
+
+        self.endpoint_input = QLineEdit("/api/overseas/balance")
+        self.api_id_input = QLineEdit("kt00004")
+
+        self.payload_input = QTextEdit()
+        self.payload_input.setPlainText(
+            json.dumps(
+                {
+                    "CANO": "00000000",
+                    "ACNT_PRDT_CD": "01",
+                    "OVRS_EXCG_CD": "NASD",
+                    "TR_CCY_CD": "USD",
+                },
+                indent=4,
             )
+        )
 
-        self.login_event_loop: Optional[QEventLoop] = None
-        self.comm_event_loop: Optional[QEventLoop] = None
+        self.authenticate_button = QPushButton("Get Access Token")
+        self.authenticate_button.clicked.connect(self._authenticate)
 
-        try:
-            self.OnEventConnect.connect(self._on_login)
-            self.OnReceiveTrData.connect(self._on_receive_tr_data)
-        except AttributeError as exc:
-            raise RuntimeError(
-                "Kiwoom OpenAPI+ 이벤트를 초기화하지 못했습니다. "
-                "키움 OpenAPI+가 올바르게 설치되었는지 확인해주세요."
-            ) from exc
+        self.fetch_button = QPushButton("Fetch Overseas Balance")
+        self.fetch_button.clicked.connect(self._fetch_balance)
 
-        self.accounts: list[str] = []
-        self.account_info: Dict[str, Dict[str, str]] = {}
-        self.api_code: str = ""
+        self.summary_labels = {
+            "krw_estimated_asset": QLabel("-"),
+            "evaluation_amount": QLabel("-"),
+            "purchase_amount": QLabel("-"),
+        }
 
+        summary_grid = QGridLayout()
+        summary_grid.addWidget(QLabel("KRW Estimated Asset"), 0, 0)
+        summary_grid.addWidget(self.summary_labels["krw_estimated_asset"], 0, 1)
+        summary_grid.addWidget(QLabel("Evaluation Amount"), 1, 0)
+        summary_grid.addWidget(self.summary_labels["evaluation_amount"], 1, 1)
+        summary_grid.addWidget(QLabel("Purchase Amount"), 2, 0)
+        summary_grid.addWidget(self.summary_labels["purchase_amount"], 2, 1)
+        summary_box = QGroupBox("Summary")
+        summary_box.setLayout(summary_grid)
 
-    # ------------------------------------------------------------------
-    # Login handling
-    # ------------------------------------------------------------------
-    def login(self) -> None:
-        self.dynamicCall("CommConnect()")
-        self.login_event_loop = QEventLoop()
-        self.login_event_loop.exec_()
+        self.holdings_table = QTableWidget(0, 7)
+        self.holdings_table.setHorizontalHeaderLabels(
+            [
+                "Symbol",
+                "Name",
+                "Quantity",
+                "Buy Amount",
+                "Evaluation Amount",
+                "Average Price",
+                "Current Price",
+            ]
+        )
+        self.holdings_table.horizontalHeader().setStretchLastSection(True)
+        self.holdings_table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-    def set_personal_api_code(self, api_code: str) -> None:
-        """Store the user-provided API code for later authenticated requests."""
+        self.raw_output = QTextEdit()
+        self.raw_output.setReadOnly(True)
+        self.raw_output.setPlaceholderText("Raw API response will appear here.")
 
-        self.api_code = api_code.strip()
+        form_layout = QFormLayout()
+        form_layout.addRow("Mode", self.mode_combo)
+        form_layout.addRow("App Key", self.appkey_input)
+        form_layout.addRow("Secret Key", self.secret_input)
+        form_layout.addRow("Endpoint", self.endpoint_input)
+        form_layout.addRow("TR ID", self.api_id_input)
+        form_widget = QWidget()
+        form_widget.setLayout(form_layout)
 
-        if not self.api_code:
-            return
+        button_row = QGridLayout()
+        button_row.addWidget(self.authenticate_button, 0, 0)
+        button_row.addWidget(self.fetch_button, 0, 1)
 
-        # Some environments expose helper methods for registering the API key.
-        # Because the availability differs by installation, any failure is
-        # silenced so the GUI continues operating with the stored value.
-        try:  # pragma: no cover - depends on native Kiwoom installation
-            self.dynamicCall(
-                "KOA_Functions(QString, QString)", "SetApiKey", self.api_code
-            )
-        except Exception:
-            pass
-    def _on_login(self, err_code: int) -> None:
-        if self.login_event_loop is None:
-            return
-        self.login_event_loop.exit()
-        self.login_event_loop = None
+        payload_box = QGroupBox("Request Payload (JSON)")
+        payload_layout = QVBoxLayout()
+        payload_layout.addWidget(self.payload_input)
+        payload_box.setLayout(payload_layout)
 
-    # ------------------------------------------------------------------
-    # Account retrieval
-    # ------------------------------------------------------------------
-    def fetch_accounts(self) -> list[str]:
-        accounts = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-        if not accounts:
-            return []
-        self.accounts = [acc for acc in accounts.split(";") if acc]
-        return self.accounts
+        control_box = QGroupBox("Configuration")
+        control_layout = QVBoxLayout()
+        control_layout.addWidget(form_widget)
+        control_layout.addLayout(button_row)
+        control_layout.addWidget(payload_box)
+        control_box.setLayout(control_layout)
 
-    def request_account_balance(self, account: str) -> None:
-        self.SetInputValue("계좌번호", account)
-        password = self.api_code or "0000"
-        self.SetInputValue("비밀번호", password)
-        self.SetInputValue("비밀번호입력매체구분", "00")
-        self.SetInputValue("조회구분", "2")
-        self.comm_event_loop = QEventLoop()
-        self.CommRqData("opw00001_req", "opw00001", 0, "1000")
-        self.comm_event_loop.exec_()
-
-    def _on_receive_tr_data(
-        self,
-        screen_no: str,
-        rqname: str,
-        trcode: str,
-        recordname: str,
-        prev_next: str,
-        data_len: int,
-        err_code: str,
-        msg1: str,
-        msg2: str,
-    ) -> None:
-        if rqname == "opw00001_req":
-            account = self.accounts[0] if self.accounts else ""
-            self.account_info[account] = {
-                "예수금": self._comm_get_data(rqname, trcode, 0, "예수금"),
-                "출금가능금액": self._comm_get_data(rqname, trcode, 0, "출금가능금액"),
-                "추정예탁자산": self._comm_get_data(rqname, trcode, 0, "추정예탁자산"),
-            }
-        if self.comm_event_loop is not None:
-            self.comm_event_loop.exit()
-            self.comm_event_loop = None
-
-    def _comm_get_data(self, rqname: str, trcode: str, idx: int, item_name: str) -> str:
-        return self.dynamicCall(
-            "CommGetData(QString, QString, QString, int, QString)",
-            trcode,
-            "",
-            rqname,
-            idx,
-            item_name,
-        ).strip()
-
-
-class MainWindow(QMainWindow):
-    """Main GUI window for stage 1 test."""
-
-    def __init__(self, kiwoom: KiwoomOpenApiWidget) -> None:
-        super().__init__()
-        self.kiwoom = kiwoom
-
-        self.setWindowTitle("StockAI - Stage 1: Account Viewer")
-        self.resize(480, 360)
-
-        self.status_label = QLabel("로그인 상태: 미로그인")
-        self.api_code_label = QLabel("개인 API 코드 (계좌 비밀번호)")
-        self.api_code_input = QLineEdit()
-        self.api_code_input.setPlaceholderText("API 코드 또는 계좌 비밀번호")
-        self.api_code_input.setEchoMode(QLineEdit.Password)
-        self.account_input = QLineEdit()
-        self.account_input.setPlaceholderText("계좌번호")
-        self.account_input.setReadOnly(True)
-
-        self.login_button = QPushButton("로그인")
-        self.login_button.clicked.connect(self._login)
-
-        self.fetch_button = QPushButton("계좌 조회")
-        self.fetch_button.clicked.connect(self._fetch_account)
-        self.fetch_button.setEnabled(False)
-
-        self.output = QTextEdit()
-        self.output.setReadOnly(True)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.api_code_label)
-        layout.addWidget(self.api_code_input)
-        layout.addWidget(self.account_input)
-        layout.addWidget(self.login_button)
-        layout.addWidget(self.fetch_button)
-        layout.addWidget(self.output)
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(control_box)
+        main_layout.addWidget(summary_box)
+        main_layout.addWidget(self.holdings_table)
+        main_layout.addWidget(QLabel("Raw Response"))
+        main_layout.addWidget(self.raw_output)
 
         container = QWidget()
-        container.setLayout(layout)
+        container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-    def _login(self) -> None:
-        self.kiwoom.set_personal_api_code(self.api_code_input.text())
-        try:
-            self.kiwoom.login()
-        except Exception as exc:  # pragma: no cover - ActiveX errors on unsupported OS
-            QMessageBox.critical(self, "로그인 실패", str(exc))
+        self.client = KiwoomRestClient(mode=self.mode_combo.currentText())
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+    def _mode_changed(self, mode: str) -> None:
+        self.client = KiwoomRestClient(mode=mode)
+        if mode == "mock":
+            self.raw_output.setPlainText("Running in mock mode. Real network calls are disabled.")
+        else:
+            self.raw_output.clear()
+
+    def _authenticate(self) -> None:
+        if self.client.mode == "mock":
+            QMessageBox.information(self, "Mock Mode", "Mock mode does not require authentication.")
             return
 
-        accounts = self.kiwoom.fetch_accounts()
-        if not accounts:
-            QMessageBox.warning(self, "계좌 없음", "등록된 계좌를 찾을 수 없습니다.")
-            return
-
-        first_account = accounts[0]
-        self.account_input.setText(first_account)
-        self.status_label.setText("로그인 상태: 로그인 완료")
-        self.fetch_button.setEnabled(True)
-        self.output.append("로그인에 성공했습니다. 계좌를 선택해주세요.")
-
-    def _fetch_account(self) -> None:
-        account = self.account_input.text().strip()
-        if not account:
-            QMessageBox.warning(self, "계좌 선택", "조회할 계좌를 선택해주세요.")
+        appkey = self.appkey_input.text().strip()
+        secret = self.secret_input.text().strip()
+        if not appkey or not secret:
+            QMessageBox.warning(self, "Missing Credentials", "Enter both app key and secret key.")
             return
 
         try:
-            self.kiwoom.request_account_balance(account)
-        except Exception as exc:  # pragma: no cover
-            QMessageBox.critical(self, "조회 실패", str(exc))
+            token = self.client.authenticate(appkey, secret)
+        except Exception as exc:
+            QMessageBox.critical(self, "Authentication Failed", str(exc))
             return
 
-        data = self.kiwoom.account_info.get(account)
-        if not data:
-            QMessageBox.warning(self, "데이터 없음", "계좌 정보를 가져오지 못했습니다.")
+        QMessageBox.information(self, "Authentication", "Access token acquired successfully.")
+        self.raw_output.setPlainText(f"Access token acquired: {token[:6]}... (hidden)")
+
+    def _fetch_balance(self) -> None:
+        try:
+            payload = json.loads(self.payload_input.toPlainText())
+            if not isinstance(payload, dict):
+                raise ValueError("Payload root must be a JSON object.")
+        except json.JSONDecodeError as exc:
+            QMessageBox.critical(self, "Invalid Payload", f"JSON decode error: {exc}")
+            return
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid Payload", str(exc))
             return
 
-        balance = AccountBalance.from_raw(account, data)
-        self._display_account_info(balance)
+        endpoint = self.endpoint_input.text().strip()
+        api_id = self.api_id_input.text().strip()
+        if not endpoint.startswith("/"):
+            QMessageBox.warning(self, "Invalid Endpoint", "Endpoint should start with '/' (e.g. /api/...).")
+            return
+        if not api_id:
+            QMessageBox.warning(self, "Missing TR ID", "Enter the TR ID (e.g. kt00004).")
+            return
 
-    def _display_account_info(self, balance: AccountBalance) -> None:
-        self.output.clear()
-        self.output.append(f"계좌번호: {balance.account_number}")
-        self.output.append(f"예수금: {balance.deposit}")
-        self.output.append(f"출금가능금액: {balance.available_funds}")
-        self.output.append(f"추정예탁자산: {balance.estimated_value}")
+        try:
+            summary, holdings, raw = self.client.fetch_overseas_balance(
+                payload,
+                endpoint=endpoint,
+                api_id=api_id,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Request Failed", str(exc))
+            return
+
+        self._update_summary(summary)
+        self._update_holdings_table(holdings)
+        self.raw_output.setPlainText(json.dumps(raw, indent=4, ensure_ascii=False))
+
+    # ------------------------------------------------------------------
+    # UI helpers
+    # ------------------------------------------------------------------
+    def _update_summary(self, summary: OverseasSummary) -> None:
+        self.summary_labels["krw_estimated_asset"].setText(f"{summary.krw_estimated_asset:,.0f}")
+        self.summary_labels["evaluation_amount"].setText(f"{summary.evaluation_amount:,.0f}")
+        self.summary_labels["purchase_amount"].setText(f"{summary.purchase_amount:,.0f}")
+
+    def _update_holdings_table(self, holdings: List[OverseasHolding]) -> None:
+        self.holdings_table.setRowCount(len(holdings))
+        for row, item in enumerate(holdings):
+            data = [
+                item.symbol,
+                item.name,
+                f"{item.quantity:,.2f}",
+                f"{item.buy_amount:,.0f}",
+                f"{item.eval_amount:,.0f}",
+                f"{item.average_price:,.2f}",
+                f"{item.current_price:,.2f}",
+            ]
+            for column, value in enumerate(data):
+                cell = QTableWidgetItem(value)
+                if column >= 2:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.holdings_table.setItem(row, column, cell)
 
 
 def run() -> None:
-    QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
-
-    try:
-        kiwoom = KiwoomOpenApiWidget()
-    except RuntimeError as exc:
-        QMessageBox.critical(None, "Kiwoom OpenAPI 오류", str(exc))
-        sys.exit(1)
-    window = MainWindow(kiwoom)
+    window = Stage1Window()
     window.show()
-
     sys.exit(app.exec_())
 
 
