@@ -76,11 +76,18 @@ class KiwoomRestClient:
         self.mode = mode
         self.host = "https://api.kiwoom.com" if mode == "real" else "https://mockapi.kiwoom.com"
         self._access_token: Optional[str] = None
+        self._appkey: Optional[str] = None
+        self._appsecret: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def set_credentials(self, appkey: str, secretkey: str) -> None:
+        self._appkey = appkey.strip()
+        self._appsecret = secretkey.strip()
+
     def authenticate(self, appkey: str, secretkey: str) -> str:
+        self.set_credentials(appkey, secretkey)
         payload = {
             "grant_type": "client_credentials",
             "appkey": appkey,
@@ -102,6 +109,8 @@ class KiwoomRestClient:
         *,
         endpoint: str,
         api_id: str,
+        tr_id: Optional[str] = None,
+        custtype: str = "P",
         cont_yn: str = "N",
         next_key: str = "",
     ) -> Tuple[OverseasSummary, List[OverseasHolding], Dict[str, Any]]:
@@ -121,6 +130,8 @@ class KiwoomRestClient:
             payload,
             token=self._access_token,
             api_id=api_id,
+            tr_id=tr_id,
+            custtype=custtype,
             cont_yn=cont_yn,
             next_key=next_key,
         )
@@ -140,6 +151,8 @@ class KiwoomRestClient:
         *,
         token: Optional[str] = None,
         api_id: Optional[str] = None,
+        tr_id: Optional[str] = None,
+        custtype: Optional[str] = None,
         cont_yn: str = "N",
         next_key: str = "",
     ) -> Optional[Dict[str, Any]]:
@@ -150,23 +163,41 @@ class KiwoomRestClient:
             headers["authorization"] = f"Bearer {token}"
             headers["cont-yn"] = cont_yn
             headers["next-key"] = next_key
-            if api_id:
-                headers["api-id"] = api_id
+        if api_id:
+            headers["api-id"] = api_id
+        if tr_id:
+            headers["tr_id"] = tr_id
+        if custtype:
+            headers["custtype"] = custtype
+        if self._appkey:
+            headers["appkey"] = self._appkey
+        if self._appsecret:
+            headers["appsecret"] = self._appsecret
 
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=10)
         except requests.RequestException as exc:
             raise RuntimeError(f"HTTP request failed: {exc}") from exc
 
-        if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-
         try:
             body = response.json()
-        except ValueError as exc:
-            raise RuntimeError("Response is not valid JSON.") from exc
+        except ValueError:
+            body = None
 
-        return body if isinstance(body, dict) else None
+        if response.status_code >= 400:
+            message = response.text
+            if isinstance(body, dict):
+                message = (
+                    body.get("message")
+                    or body.get("msg")
+                    or json.dumps(body, ensure_ascii=False)
+                )
+            raise RuntimeError(f"HTTP {response.status_code}: {message}")
+
+        if not isinstance(body, dict):
+            raise RuntimeError("Response is not a JSON object.")
+
+        return body
 
     def _parse_overseas_balance(
         self,
@@ -279,6 +310,9 @@ class Stage1Window(QMainWindow):
         self.setWindowTitle("StockAI - Stage 1 Overseas Balance Viewer")
         self.resize(860, 620)
 
+        self.current_appkey: str = ""
+        self.current_secret: str = ""
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["real", "mock"])
         self.mode_combo.currentTextChanged.connect(self._mode_changed)
@@ -289,6 +323,12 @@ class Stage1Window(QMainWindow):
 
         self.endpoint_input = QLineEdit("/api/overseas/balance")
         self.api_id_input = QLineEdit("kt00004")
+        self.api_id_input.setPlaceholderText("api-id header value, e.g. kt00004")
+        self.tr_header_input = QLineEdit()
+        self.tr_header_input.setPlaceholderText("Optional tr_id header, e.g. TTTS3004R")
+        self.custtype_input = QLineEdit("P")
+        self.custtype_input.setMaxLength(1)
+        self.custtype_input.setPlaceholderText("Customer type (P or B)")
 
         self.payload_input = QTextEdit()
         self.payload_input.setPlainText(
@@ -349,7 +389,9 @@ class Stage1Window(QMainWindow):
         form_layout.addRow("App Key", self.appkey_input)
         form_layout.addRow("Secret Key", self.secret_input)
         form_layout.addRow("Endpoint", self.endpoint_input)
-        form_layout.addRow("TR ID", self.api_id_input)
+        form_layout.addRow("API ID", self.api_id_input)
+        form_layout.addRow("TR Header (tr_id)", self.tr_header_input)
+        form_layout.addRow("Customer Type", self.custtype_input)
         form_widget = QWidget()
         form_widget.setLayout(form_layout)
 
@@ -387,20 +429,26 @@ class Stage1Window(QMainWindow):
     # ------------------------------------------------------------------
     def _mode_changed(self, mode: str) -> None:
         self.client = KiwoomRestClient(mode=mode)
+        if self.current_appkey or self.current_secret:
+            self.client.set_credentials(self.current_appkey, self.current_secret)
         if mode == "mock":
             self.raw_output.setPlainText("Running in mock mode. Real network calls are disabled.")
         else:
             self.raw_output.clear()
 
     def _authenticate(self) -> None:
-        if self.client.mode == "mock":
-            QMessageBox.information(self, "Mock Mode", "Mock mode does not require authentication.")
-            return
-
         appkey = self.appkey_input.text().strip()
         secret = self.secret_input.text().strip()
         if not appkey or not secret:
             QMessageBox.warning(self, "Missing Credentials", "Enter both app key and secret key.")
+            return
+
+        self.current_appkey = appkey
+        self.current_secret = secret
+        self.client.set_credentials(appkey, secret)
+
+        if self.client.mode == "mock":
+            QMessageBox.information(self, "Mock Mode", "Mock mode does not require authentication.")
             return
 
         try:
@@ -426,6 +474,10 @@ class Stage1Window(QMainWindow):
 
         endpoint = self.endpoint_input.text().strip()
         api_id = self.api_id_input.text().strip()
+        tr_id_header = self.tr_header_input.text().strip() or None
+        custtype = self.custtype_input.text().strip().upper() or "P"
+        if len(custtype) > 1:
+            custtype = custtype[0]
         if not endpoint.startswith("/"):
             QMessageBox.warning(self, "Invalid Endpoint", "Endpoint should start with '/' (e.g. /api/...).")
             return
@@ -438,9 +490,12 @@ class Stage1Window(QMainWindow):
                 payload,
                 endpoint=endpoint,
                 api_id=api_id,
+                tr_id=tr_id_header,
+                custtype=custtype,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Request Failed", str(exc))
+            self.raw_output.setPlainText(str(exc))
             return
 
         self._update_summary(summary)
