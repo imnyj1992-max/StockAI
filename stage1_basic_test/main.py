@@ -78,6 +78,7 @@ class KiwoomRestClient:
         self._access_token: Optional[str] = None
         self._appkey: Optional[str] = None
         self._appsecret: Optional[str] = None
+        self._hashkey_cache: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -85,6 +86,7 @@ class KiwoomRestClient:
     def set_credentials(self, appkey: str, secretkey: str) -> None:
         self._appkey = appkey.strip()
         self._appsecret = secretkey.strip()
+        self._hashkey_cache.clear()
 
     def authenticate(self, appkey: str, secretkey: str) -> str:
         self.set_credentials(appkey, secretkey)
@@ -174,6 +176,12 @@ class KiwoomRestClient:
         if self._appsecret:
             headers["appsecret"] = self._appsecret
 
+        hashkey = None
+        if token and payload and self.mode == "real":
+            hashkey = self._generate_hashkey(payload)
+            if hashkey:
+                headers["hashkey"] = hashkey
+
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=10)
         except requests.RequestException as exc:
@@ -198,6 +206,43 @@ class KiwoomRestClient:
             raise RuntimeError("Response is not a JSON object.")
 
         return body
+
+    def _generate_hashkey(self, payload: Dict[str, Any]) -> Optional[str]:
+        if not self._appkey or not self._appsecret:
+            return None
+        cache_key = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        if cache_key in self._hashkey_cache:
+            return self._hashkey_cache[cache_key]
+
+        url = self.host + "/oauth2/hashkey"
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "appkey": self._appkey,
+            "appsecret": self._appsecret,
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Hashkey request failed: {exc}") from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Hashkey response is not valid JSON.") from exc
+
+        if response.status_code >= 400:
+            message = body.get("message") if isinstance(body, dict) else response.text
+            raise RuntimeError(f"Hashkey request failed ({response.status_code}): {message}")
+
+        if not isinstance(body, dict):
+            raise RuntimeError("Hashkey response is not a JSON object.")
+
+        key = body.get("hashkey") or body.get("HASHKEY")
+        if not key:
+            raise RuntimeError("Hashkey not found in response.")
+
+        self._hashkey_cache[cache_key] = key
+        return key
 
     def _parse_overseas_balance(
         self,
