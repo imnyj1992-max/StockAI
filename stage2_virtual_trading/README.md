@@ -8,7 +8,9 @@ Stage 2 now ships with two complementary entry points:
 ## Features
 
 - Configure mock App Key/Secret and send authenticated buy/sell/hold requests through the GUI.
+- Fetch mock account snapshots (예수금/평가금/손익) directly from the GUI.
 - Track virtual portfolio state (cash, market value, PnL) and review a trade log.
+- Kick off the full Stage‑A/Stage‑B “Auto Learn” pipeline from the GUI with a single button (synthetic data by default).
 - Generate synthetic OHLCV + indicator data, train a selector (LightGBM/XGBoost-style), and feed the top‑K tickers into a tick-level RL environment.
 - Optional PPO training via `stable-baselines3`; automatic fallback to a deterministic baseline when the dependency is missing.
 

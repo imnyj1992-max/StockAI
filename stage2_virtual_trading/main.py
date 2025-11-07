@@ -13,8 +13,9 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import requests
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -31,6 +32,36 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from ai import (
+        MockTrainingConfig,
+        SelectorConfig,
+        WalkForwardConfig,
+        generate_synthetic_universe,
+        make_vec_envs,
+        prepare_datasets,
+        run_selector_stage,
+        train_rl_agent,
+    )
+
+    AI_MODULE_AVAILABLE = True
+except Exception:  # pragma: no cover - allow running without package install
+    try:
+        from stage2_virtual_trading.ai import (
+            MockTrainingConfig,
+            SelectorConfig,
+            WalkForwardConfig,
+            generate_synthetic_universe,
+            make_vec_envs,
+            prepare_datasets,
+            run_selector_stage,
+            train_rl_agent,
+        )
+
+        AI_MODULE_AVAILABLE = True
+    except Exception:  # pragma: no cover
+        AI_MODULE_AVAILABLE = False
 
 
 @dataclass
@@ -148,6 +179,19 @@ class VirtualBroker:
         return self.realised_pnl + sum(pos.unrealised_pnl for pos in self.positions.values())
 
 
+def _safe_decimal(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.replace(",", ""))
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 class KiwoomOrderClient:
     """Minimal REST client for Kiwoom mock-trading order APIs."""
 
@@ -196,9 +240,47 @@ class KiwoomOrderClient:
         tr_id: str,
         custtype: str,
         payload: Dict[str, Any],
+        api_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            endpoint=endpoint,
+            tr_id=tr_id,
+            custtype=custtype,
+            payload=payload,
+            api_id=api_id,
+            require_hashkey=True,
+        )
+
+    def fetch_account_summary(
+        self,
+        *,
+        endpoint: str,
+        tr_id: str,
+        custtype: str,
+        payload: Dict[str, Any],
+        api_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            endpoint=endpoint,
+            tr_id=tr_id,
+            custtype=custtype,
+            payload=payload,
+            api_id=api_id,
+            require_hashkey=False,
+        )
+
+    def _request(
+        self,
+        *,
+        endpoint: str,
+        tr_id: str,
+        custtype: str,
+        payload: Dict[str, Any],
+        api_id: Optional[str],
+        require_hashkey: bool,
     ) -> Dict[str, Any]:
         if not self._access_token:
-            raise RuntimeError("먼저 모의투자 인증을 진행해주세요.")
+            raise RuntimeError("모의투자 인증을 먼저 진행해주세요.")
         if not self._appkey or not self._appsecret:
             raise RuntimeError("App Key/Secret이 설정되지 않았습니다.")
         if not endpoint.startswith("/"):
@@ -213,16 +295,19 @@ class KiwoomOrderClient:
             "custtype": custtype or "P",
             "tr_id": tr_id,
         }
+        if api_id:
+            headers["api-id"] = api_id
 
-        hashkey = self._generate_hashkey(payload_json)
-        if hashkey:
-            headers["hashkey"] = hashkey
+        if require_hashkey:
+            hashkey = self._generate_hashkey(payload_json)
+            if hashkey:
+                headers["hashkey"] = hashkey
 
         url = f"{self.host}{endpoint}"
         try:
             response = requests.post(url, headers=headers, data=payload_json.encode("utf-8"), timeout=10)
         except requests.RequestException as exc:  # pragma: no cover - network
-            raise RuntimeError(f"주문 요청 실패: {exc}") from exc
+            raise RuntimeError(f"HTTP 요청 실패: {exc}") from exc
 
         return self._parse_response(response)
 
@@ -286,10 +371,17 @@ class VirtualTradingWindow(QMainWindow):
         self.custtype_input = QLineEdit("P")
         self.order_division_input = QLineEdit("00")
         self.order_endpoint_input = QLineEdit("/api/dostk/v1/order")
+        self.order_api_id_input = QLineEdit()
+        self.order_api_id_input.setPlaceholderText("주문 api-id (optional)")
         self.buy_tr_id_input = QLineEdit("VTTC0802U")
         self.sell_tr_id_input = QLineEdit("VTTC0801U")
+        self.balance_endpoint_input = QLineEdit("/api/dostk/acnt")
+        self.balance_tr_id_input = QLineEdit("TTTS3004R")
+        self.balance_api_id_input = QLineEdit("kt00004")
         self.token_button = QPushButton("모의투자 인증")
         self.token_button.clicked.connect(self._authenticate_mock)
+        self.fetch_balance_button = QPushButton("모의 계좌 조회")
+        self.fetch_balance_button.clicked.connect(self._fetch_account_snapshot)
 
         # ------------------------------------------------------------------
         # Widgets
@@ -314,8 +406,14 @@ class VirtualTradingWindow(QMainWindow):
         self.hold_button = QPushButton("관망")
         self.hold_button.clicked.connect(self._hold)
         self._set_trade_controls_enabled(False)
+        self.auto_train_button = QPushButton("Auto Learn (Selector + RL)")
+        self.auto_train_button.clicked.connect(self._trigger_auto_training)
+        self.auto_train_button.setEnabled(AI_MODULE_AVAILABLE)
 
         self.balance_label = QLabel("현금: - / 평가금액: - / 손익: -")
+        self.account_snapshot_label = QLabel("계좌 정보: -")
+        self.ai_status_label = QLabel("AI 상태: 대기")
+        self.auto_trainer = None
 
         self.positions_table = QTableWidget(0, 6)
         self.positions_table.setHorizontalHeaderLabels(
@@ -342,11 +440,20 @@ class VirtualTradingWindow(QMainWindow):
         settings_layout.addWidget(self.order_division_input, 2, 3)
         settings_layout.addWidget(QLabel("주문 Endpoint"), 3, 0)
         settings_layout.addWidget(self.order_endpoint_input, 3, 1, 1, 3)
-        settings_layout.addWidget(QLabel("매수 TR ID"), 4, 0)
-        settings_layout.addWidget(self.buy_tr_id_input, 4, 1)
-        settings_layout.addWidget(QLabel("매도 TR ID"), 4, 2)
-        settings_layout.addWidget(self.sell_tr_id_input, 4, 3)
-        settings_layout.addWidget(self.token_button, 5, 0, 1, 4, alignment=Qt.AlignRight)
+        settings_layout.addWidget(QLabel("주문 API ID"), 4, 0)
+        settings_layout.addWidget(self.order_api_id_input, 4, 1)
+        settings_layout.addWidget(QLabel("매수 TR ID"), 4, 2)
+        settings_layout.addWidget(self.buy_tr_id_input, 4, 3)
+        settings_layout.addWidget(QLabel("매도 TR ID"), 5, 0)
+        settings_layout.addWidget(self.sell_tr_id_input, 5, 1)
+        settings_layout.addWidget(QLabel("계좌 Endpoint"), 5, 2)
+        settings_layout.addWidget(self.balance_endpoint_input, 5, 3)
+        settings_layout.addWidget(QLabel("계좌 TR ID"), 6, 0)
+        settings_layout.addWidget(self.balance_tr_id_input, 6, 1)
+        settings_layout.addWidget(QLabel("계좌 API ID"), 6, 2)
+        settings_layout.addWidget(self.balance_api_id_input, 6, 3)
+        settings_layout.addWidget(self.token_button, 7, 0, 1, 2, alignment=Qt.AlignRight)
+        settings_layout.addWidget(self.fetch_balance_button, 7, 2, 1, 2, alignment=Qt.AlignRight)
         settings_box = QGroupBox("모의투자 설정")
         settings_box.setLayout(settings_layout)
 
@@ -354,6 +461,7 @@ class VirtualTradingWindow(QMainWindow):
         control_layout.addWidget(QLabel("초기 현금"), 0, 0)
         control_layout.addWidget(self.initial_cash_input, 0, 1)
         control_layout.addWidget(self.start_button, 0, 2)
+        control_layout.addWidget(self.auto_train_button, 0, 3)
 
         trade_layout = QHBoxLayout()
         trade_layout.addWidget(self.symbol_input)
@@ -367,7 +475,9 @@ class VirtualTradingWindow(QMainWindow):
         main_layout.addWidget(settings_box)
         main_layout.addLayout(control_layout)
         main_layout.addLayout(trade_layout)
+        main_layout.addWidget(self.account_snapshot_label)
         main_layout.addWidget(self.balance_label)
+        main_layout.addWidget(self.ai_status_label)
         main_layout.addWidget(self.positions_table)
         main_layout.addWidget(QLabel("거래 로그"))
         main_layout.addWidget(self.log_output)
@@ -394,7 +504,7 @@ class VirtualTradingWindow(QMainWindow):
 
         self._set_trade_controls_enabled(True)
         self.log_output.clear()
-        self.log_output.append(f"초기 현금 {initial_cash:,.0f}원으로 가상 거래를 시작합니다.")
+        self._append_log(f"초기 현금 {initial_cash:,.0f}원으로 가상 거래를 시작합니다.")
         self._update_balance_label()
         self.positions_table.setRowCount(0)
 
@@ -427,11 +537,11 @@ class VirtualTradingWindow(QMainWindow):
             client.authenticate()
         except Exception as exc:  # pragma: no cover - network
             QMessageBox.critical(self, "모의투자 인증 실패", str(exc))
-            self.log_output.append(f"[Mock API] 인증 실패: {exc}")
+            self._append_log(f"[Mock API] 인증 실패: {exc}")
             return
 
         QMessageBox.information(self, "모의투자 인증", "모의투자 액세스 토큰이 발급되었습니다.")
-        self.log_output.append("[Mock API] 인증 완료")
+        self._append_log("[Mock API] 인증 완료")
 
     def _build_order_payload(self, symbol: str, price: float, quantity: int) -> Dict[str, Any]:
         account = self.account_input.text().strip()
@@ -448,35 +558,144 @@ class VirtualTradingWindow(QMainWindow):
             "ORD_UNPR": f"{price:.2f}",
         }
 
+    def _fetch_account_snapshot(self) -> None:
+        client = self._ensure_order_client()
+        if not client.access_token:
+            QMessageBox.warning(self, "모의투자 인증", "먼저 모의투자 인증을 진행해주세요.")
+            return
+        endpoint = self.balance_endpoint_input.text().strip() or "/api/dostk/acnt"
+        tr_id = self.balance_tr_id_input.text().strip()
+        if not tr_id:
+            QMessageBox.warning(self, "입력 필요", "계좌 조회용 TR ID를 입력해주세요.")
+            return
+        api_id = self.balance_api_id_input.text().strip() or None
+        custtype = self.custtype_input.text().strip() or "P"
+        try:
+            payload = self._build_account_payload()
+        except ValueError as exc:
+            QMessageBox.warning(self, "입력 필요", str(exc))
+            return
+        try:
+            response = client.fetch_account_summary(
+                endpoint=endpoint,
+                tr_id=tr_id,
+                custtype=custtype,
+                payload=payload,
+                api_id=api_id,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "계좌 조회 실패", str(exc))
+            self._append_log(f"[Account] 조회 실패: {exc}")
+            return
+        pretty = json.dumps(response, ensure_ascii=False, indent=2)
+        self._append_log(f"[Account]\n{pretty}")
+        summary_text = self._format_account_summary(response)
+        self.account_snapshot_label.setText(summary_text)
+
+    def _build_account_payload(self) -> Dict[str, Any]:
+        account = self.account_input.text().strip()
+        if not account:
+            raise ValueError("계좌번호를 입력해주세요.")
+        product_code = self.product_code_input.text().strip() or "01"
+        return {
+            "CANO": account,
+            "ACNT_PRDT_CD": product_code,
+            "qry_tp": "0",
+            "dmst_stex_tp": "KRX",
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "N",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "FUND_STTL_DVSN_CD": "01",
+            "PRCS_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+    def _format_account_summary(self, payload: Dict[str, Any]) -> str:
+        summary = None
+        for key in ("output", "output1", "result"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                summary = value
+                break
+        if summary is None:
+            summary = payload
+        d2 = _safe_decimal(summary.get("d2_deposit") or summary.get("d2_entra_amt"))
+        eval_amt = _safe_decimal(summary.get("tot_evalu_amt") or summary.get("tot_evlu_amt"))
+        cash = _safe_decimal(summary.get("prsm_dpst") or summary.get("prsm_dpst_aset_amt"))
+        total_pnl = _safe_decimal(summary.get("tot_pnl_amt") or summary.get("lspft_amt"))
+        return f"계좌 정보: 예수금 {d2:,.0f}원 / 평가금 {eval_amt:,.0f}원 / 현금 {cash:,.0f}원 / 손익 {total_pnl:,.0f}원"
+
     def _send_order_to_api(self, side: str, symbol: str, price: float, quantity: int) -> None:
         endpoint = self.order_endpoint_input.text().strip()
         tr_input = self.buy_tr_id_input if side == "BUY" else self.sell_tr_id_input
         tr_id = tr_input.text().strip()
         if not endpoint or not tr_id:
-            self.log_output.append(f"[Mock API] {side} 요청 건너뜀 (endpoint / TR ID 미입력)")
+            self._append_log(f"[Mock API] {side} 요청 건너뜀 (endpoint / TR ID 미입력)")
             return
 
         client = self._ensure_order_client()
         if not client.access_token:
-            self.log_output.append("[Mock API] 액세스 토큰이 없어 주문을 전송하지 않았습니다.")
+            self._append_log("[Mock API] 액세스 토큰이 없어 주문을 전송하지 않았습니다.")
             return
 
         try:
             payload = self._build_order_payload(symbol, price, quantity)
         except ValueError as exc:
-            self.log_output.append(f"[Mock API] {side} 주문 실패: {exc}")
+            self._append_log(f"[Mock API] {side} 주문 실패: {exc}")
             return
 
         custtype = self.custtype_input.text().strip() or "P"
+        api_id = self.order_api_id_input.text().strip() or None
         try:
-            response = client.place_order(endpoint=endpoint, tr_id=tr_id, custtype=custtype, payload=payload)
+            response = client.place_order(
+                endpoint=endpoint,
+                tr_id=tr_id,
+                custtype=custtype,
+                payload=payload,
+                api_id=api_id,
+            )
         except Exception as exc:  # pragma: no cover - network
-            self.log_output.append(f"[Mock API] {side} 주문 실패: {exc}")
+            self._append_log(f"[Mock API] {side} 주문 실패: {exc}")
             return
 
         summary = response.get("msg1") or response.get("message") or json.dumps(response, ensure_ascii=False)
-        self.log_output.append(f"[Mock API] {side} 주문 성공: {summary}")
+        self._append_log(f"[Mock API] {side} 주문 성공: {summary}")
 
+    def _trigger_auto_training(self) -> None:
+        if not AI_MODULE_AVAILABLE:
+            QMessageBox.warning(self, "AI 모듈 없음", "ai 패키지가 설치되지 않아 자동 학습을 실행할 수 없습니다.")
+            return
+        if self.auto_trainer and self.auto_trainer.isRunning():
+            QMessageBox.information(self, "학습 진행 중", "이미 학습이 진행 중입니다.")
+            return
+        self.auto_train_button.setEnabled(False)
+        self.ai_status_label.setText("AI 상태: 학습 중 ...")
+        self._append_log("[AI] Auto Learn을 시작합니다.")
+        self.auto_trainer = AutoTrainWorker(parent=self, ticks=60, top_k=10, timesteps=50_000)
+        self.auto_trainer.progress.connect(self._append_log)
+        self.auto_trainer.completed.connect(self._auto_training_completed)
+        self.auto_trainer.failed.connect(self._auto_training_failed)
+        self.auto_trainer.start()
+
+    def _auto_training_completed(self, tickers: List[str]) -> None:
+        self.auto_train_button.setEnabled(True)
+        names = ", ".join(tickers) if tickers else "없음"
+        self._append_log(f"[AI] 학습 완료. 선택 종목: {names}")
+        self.ai_status_label.setText(f"AI 상태: 완료 (K={len(tickers)})")
+        self.auto_trainer = None
+
+    def _auto_training_failed(self, message: str) -> None:
+        self.auto_train_button.setEnabled(True)
+        self._append_log(f"[AI] 학습 실패: {message}")
+        self.ai_status_label.setText("AI 상태: 실패")
+        self.auto_trainer = None
+
+    # ------------------------------------------------------------------
+    # Trade handlers
     # ------------------------------------------------------------------
     # Trade handlers
     # ------------------------------------------------------------------
@@ -532,10 +751,13 @@ class VirtualTradingWindow(QMainWindow):
     # ------------------------------------------------------------------
     # UI helpers
     # ------------------------------------------------------------------
+    def _append_log(self, message: str) -> None:
+        self.log_output.append(message)
+
     def _log_last_history(self) -> None:
         broker = self._require_broker()
         if broker.history:
-            self.log_output.append(broker.history[-1])
+            self._append_log(broker.history[-1])
 
     def _update_balance_label(self) -> None:
         broker = self._require_broker()
@@ -568,6 +790,60 @@ class VirtualTradingWindow(QMainWindow):
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         return item
+
+
+
+class AutoTrainWorker(QThread):
+    progress = pyqtSignal(str)
+    completed = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, *, ticks: int, top_k: int, timesteps: int, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.ticks = ticks
+        self.top_k = top_k
+        self.timesteps = timesteps
+        self.fees = {"buy": 0.00015, "sell": 0.00015, "tax_sell": 0.0005}
+        self.slippage = 5.0
+
+    def run(self) -> None:
+        if not AI_MODULE_AVAILABLE:
+            self.failed.emit("AI 모듈이 설치되어 있지 않습니다.")
+            return
+        try:
+            self.progress.emit("[AI] Synthetic 데이터 생성 중 ...")
+            data = generate_synthetic_universe(num_tickers=max(self.top_k * 2, 20), num_minutes=5_000)
+            wf_cfg = WalkForwardConfig(horizon_ticks=self.ticks)
+            selector_cfg = SelectorConfig(top_k=self.top_k, horizon_ticks=self.ticks)
+            bundle = prepare_datasets(data, wf_cfg)
+            self.progress.emit("[AI] Stage-A Selector 학습 중 ...")
+            result = run_selector_stage(bundle, selector_cfg, wf_cfg)
+            arrays, prices = self._build_arrays(data, bundle, result.selected)
+            if not arrays:
+                raise RuntimeError("선택된 종목이 없습니다.")
+            self.progress.emit(f"[AI] Stage-B RL 환경 구성 (K={len(arrays)}) ...")
+            envs = make_vec_envs(arrays, prices, window=self.ticks, fees=self.fees, slippage_bps=self.slippage)
+            rl_cfg = MockTrainingConfig(total_timesteps=self.timesteps, window=self.ticks)
+            train_rl_agent(envs, rl_cfg)
+            self.completed.emit(list(result.selected))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _build_arrays(self, data, bundle, selected):
+        arrays = []
+        prices = []
+        for ticker in selected:
+            try:
+                feat = bundle.features.xs(ticker)
+            except KeyError:
+                continue
+            feat_values = feat.values.astype(np.float32)
+            raw = data.xs(ticker)
+            aligned = raw.loc[feat.index, "close"].values.astype(np.float32)
+            if len(feat_values) > self.ticks:
+                arrays.append(feat_values)
+                prices.append(aligned)
+        return arrays, prices
 
 
 def run() -> None:
