@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sys
@@ -88,11 +88,26 @@ class AccountHolding:
     profit_loss_rate: float
 
 
-# Optional hashkey behavior is controlled at runtime; hashkey is not always required.
+@dataclass
+class OverseasSummary:
+    krw_estimated_asset: float
+    evaluation_amount: float
+    purchase_amount: float
+
+
+@dataclass
+class OverseasHolding:
+    symbol: str
+    name: str
+    quantity: float
+    purchase_amount: float
+    evaluation_amount: float
+    average_price: float
+    current_price: float
 
 
 class KiwoomRestClient:
-    """REST client to communicate with Kiwoom domestic account APIs (e.g. kt00004)."""
+    """Minimal Kiwoom REST client supporting domestic and overseas balance TRs."""
 
     def __init__(self, *, mode: str = "real", require_hashkey: bool = False) -> None:
         if mode not in {"real", "mock"}:
@@ -165,6 +180,41 @@ class KiwoomRestClient:
             raise RuntimeError("Account balance request failed.")
 
         summary, holdings = self._parse_account_balance(response)
+        return summary, holdings, response
+
+    def fetch_overseas_balance(
+        self,
+        payload: Dict[str, Any],
+        *,
+        endpoint: str,
+        api_id: str,
+        tr_id: Optional[str] = None,
+        custtype: str = "P",
+        cont_yn: str = "N",
+        next_key: str = "",
+    ) -> Tuple[OverseasSummary, List[OverseasHolding], Dict[str, Any]]:
+        self.last_hashkey_error = None
+        if self.mode == "mock":
+            summary, holdings, raw = self._mock_overseas_balance()
+            return summary, holdings, raw
+
+        if not self._access_token:
+            raise RuntimeError("No access token. Authenticate first.")
+
+        response = self._post(
+            endpoint,
+            payload,
+            token=self._access_token,
+            api_id=api_id,
+            tr_id=tr_id,
+            custtype=custtype,
+            cont_yn=cont_yn,
+            next_key=next_key,
+        )
+        if response is None:
+            raise RuntimeError("Overseas balance request failed.")
+
+        summary, holdings = self._parse_overseas_balance(response)
         return summary, holdings, response
 
     def _post(
@@ -264,7 +314,6 @@ class KiwoomRestClient:
             if not message:
                 message = response.text
             if response.status_code >= 500:
-                # Hashkey may be optional for read-only TRs; keep a note and continue without it.
                 self.last_hashkey_error = message or "Unexpected server error during hashkey generation."
                 return None
             raise RuntimeError(f"Hashkey request failed ({response.status_code}): {message}")
@@ -318,10 +367,80 @@ class KiwoomRestClient:
 
         return summary, holdings
 
+    def _parse_overseas_balance(self, payload: Dict[str, Any]) -> Tuple[OverseasSummary, List[OverseasHolding]]:
+        summary_source = self._find_first_mapping(
+            payload,
+            ["output", "output1", "summary", "data", "result"],
+        )
+
+        summary = OverseasSummary(
+            krw_estimated_asset=_parse_decimal(
+                self._find_first(
+                    summary_source,
+                    [
+                        "krw_estimated_asset",
+                        "ovrs_kor_estm_amt",
+                        "ovrs_tot_estm_amt",
+                        "kor_tot_evlt_amt",
+                        "ovrs_kor_evlt_amt",
+                    ],
+                )
+            ),
+            evaluation_amount=_parse_decimal(
+                self._find_first(
+                    summary_source,
+                    ["evaluation_amount", "ovrs_evlt_amt", "ovrs_pdls_amt", "evlt_amt"],
+                )
+            ),
+            purchase_amount=_parse_decimal(
+                self._find_first(
+                    summary_source,
+                    ["purchase_amount", "ovrs_buy_amt", "ovrs_pdls_buy_amt", "buy_amt"],
+                )
+            ),
+        )
+
+        holdings_source = self._find_first_list(
+            payload,
+            ["output1", "output2", "stocks", "holdings", "items", "result_list"],
+        )
+
+        holdings: List[OverseasHolding] = []
+        for entry in holdings_source:
+            symbol = str(self._find_first(entry, ["stk_cd", "ovrs_item_cd", "code", "symbol"]) or "").strip()
+            if symbol.startswith("A") and len(symbol) > 1:
+                symbol = symbol[1:]
+            holdings.append(
+                OverseasHolding(
+                    symbol=symbol or "-",
+                    name=str(
+                        self._find_first(entry, ["stk_nm", "ovrs_item_nm", "name", "item_name"]) or "-"
+                    ).strip()
+                    or "-",
+                    quantity=_parse_decimal(
+                        self._find_first(entry, ["rmnd_qty", "ovrs_cblc_qty", "qty", "hold_qty"])
+                    ),
+                    purchase_amount=_parse_decimal(
+                        self._find_first(entry, ["pur_amt", "ovrs_buamt", "buy_amt", "pchs_amt"])
+                    ),
+                    evaluation_amount=_parse_decimal(
+                        self._find_first(entry, ["evlt_amt", "ovrs_evlt_amt", "eval_amt", "evlt_amt"])
+                    ),
+                    average_price=_parse_decimal(
+                        self._find_first(entry, ["avg_prc", "ovrs_avg_prc", "avg_price", "avg_prc"])
+                    ),
+                    current_price=_parse_decimal(
+                        self._find_first(entry, ["cur_prc", "ovrs_now_prc", "prpr", "current_price"])
+                    ),
+                )
+            )
+
+        return summary, holdings
+
     def _mock_account_balance(self) -> Tuple[AccountSummary, List[AccountHolding], Dict[str, Any]]:
         sample_response = {
-            "acnt_nm": "김키움",
-            "brch_nm": "키움은행",
+            "acnt_nm": "Sample User",
+            "brch_nm": "Sample Branch",
             "d2_entra": "000000012550",
             "aset_evlt_amt": "000000761950",
             "tot_pur_amt": "000000002786",
@@ -333,7 +452,7 @@ class KiwoomRestClient:
             "stk_acnt_evlt_prst": [
                 {
                     "stk_cd": "A005930",
-                    "stk_nm": "삼성전자",
+                    "stk_nm": "SAMSUNG ELEC",
                     "rmnd_qty": "000000000003",
                     "avg_prc": "000000124500",
                     "cur_prc": "000000070000",
@@ -349,46 +468,153 @@ class KiwoomRestClient:
         summary, holdings = self._parse_account_balance(sample_response)
         return summary, holdings, sample_response
 
+    def _mock_overseas_balance(self) -> Tuple[OverseasSummary, List[OverseasHolding], Dict[str, Any]]:
+        sample_response = {
+            "krw_estimated_asset": "00000052350000",
+            "ovrs_evlt_amt": "00000049800000",
+            "ovrs_buy_amt": "00000045900000",
+            "holdings": [
+                {
+                    "stk_cd": "AAPL",
+                    "stk_nm": "Apple",
+                    "rmnd_qty": "30",
+                    "avg_prc": "150000",
+                    "cur_prc": "170000",
+                    "evlt_amt": "5100000",
+                    "pur_amt": "4500000",
+                },
+                {
+                    "stk_cd": "TSLA",
+                    "stk_nm": "Tesla",
+                    "rmnd_qty": "10",
+                    "avg_prc": "780000",
+                    "cur_prc": "690000",
+                    "evlt_amt": "6900000",
+                    "pur_amt": "7800000",
+                },
+            ],
+        }
+        summary, holdings = self._parse_overseas_balance(sample_response)
+        return summary, holdings, sample_response
+
+    @staticmethod
+    def _find_first_mapping(payload: Dict[str, Any], candidates: List[str]) -> Dict[str, Any]:
+        for key in candidates:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                return value
+        return payload
+
+    @staticmethod
+    def _find_first(source: Optional[Dict[str, Any]], candidates: List[str]) -> Any:
+        if not source:
+            return None
+        for key in candidates:
+            if key in source:
+                return source[key]
+        return None
+
+    @staticmethod
+    def _find_first_list(payload: Dict[str, Any], candidates: List[str]) -> List[Dict[str, Any]]:
+        for key in candidates:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
 
 class Stage1Window(QMainWindow):
-    """PyQt5 GUI to display domestic account holdings via kt00004."""
+    DATA_TYPES = ("Domestic Stocks", "Overseas Stocks")
+    DOMESTIC_COLUMNS = [
+        "Symbol",
+        "Name",
+        "Quantity",
+        "Purchase Amount",
+        "Evaluation Amount",
+        "Average Price",
+        "Current Price",
+        "Profit/Loss",
+        "Profit/Loss %",
+    ]
+    OVERSEAS_COLUMNS = [
+        "Symbol",
+        "Name",
+        "Quantity",
+        "Purchase Amount",
+        "Evaluation Amount",
+        "Average Price",
+        "Current Price",
+    ]
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("StockAI - Stage 1: Account Evaluation (kt00004)")
-        self.resize(900, 640)
+        self.setWindowTitle("StockAI - Stage 1: Account Overview")
+        self.resize(960, 660)
 
         self.current_appkey: str = ""
         self.current_secret: str = ""
+        self.client: Optional[KiwoomRestClient] = None
+
+        domestic_payload = json.dumps(
+            {
+                "qry_tp": "0",
+                "dmst_stex_tp": "KRX",
+            },
+            indent=4,
+            ensure_ascii=False,
+        )
+        overseas_payload = json.dumps(
+            {
+                "CANO": "00000000",
+                "ACNT_PRDT_CD": "01",
+                "OVRS_EXCG_CD": "NASD",
+                "TR_CCY_CD": "USD",
+            },
+            indent=4,
+            ensure_ascii=False,
+        )
+
+        self.saved_configs: Dict[str, Dict[str, Any]] = {
+            "Domestic Stocks": {
+                "endpoint": "/api/dostk/acnt",
+                "api_id": "kt00004",
+                "tr_id": "TTTS3004R",
+                "custtype": "P",
+                "payload": domestic_payload,
+                "hashkey": False,
+            },
+            "Overseas Stocks": {
+                "endpoint": "/api/overseas/balance",
+                "api_id": "",
+                "tr_id": "",
+                "custtype": "P",
+                "payload": overseas_payload,
+                "hashkey": False,
+            },
+        }
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["real", "mock"])
         self.mode_combo.currentTextChanged.connect(self._mode_changed)
 
-        self.appkey_input = QLineEdit()
-        self.secret_input = QLineEdit()
+        self.data_type_combo = QComboBox()
+        self.data_type_combo.addItems(self.DATA_TYPES)
+        self.data_type_combo.currentTextChanged.connect(self._data_type_changed)
+
+        self.appkey_input = QLineEdit("eNfziSc7ibOOl8tqrI8-K-sjl9o3oKI6QpzaZANWopM")
+        self.secret_input = QLineEdit("Ei1bzCY-vO2cY4WMTty8-fJx0JmvDFJuYS7q4PUDQgs")
         self.secret_input.setEchoMode(QLineEdit.Password)
 
-        self.endpoint_input = QLineEdit("/api/dostk/acnt")
-        self.api_id_input = QLineEdit("kt00004")
+        self.endpoint_input = QLineEdit()
+        self.api_id_input = QLineEdit()
         self.api_id_input.setPlaceholderText("api-id header value")
-        self.tr_header_input = QLineEdit("TTTS3004R")
+        self.tr_header_input = QLineEdit()
         self.tr_header_input.setPlaceholderText("Optional tr_id header")
-        self.custtype_input = QLineEdit("P")
+        self.custtype_input = QLineEdit()
         self.custtype_input.setMaxLength(1)
         self.custtype_input.setPlaceholderText("Customer type (P or B)")
 
         self.payload_input = QTextEdit()
-        self.payload_input.setPlainText(
-            json.dumps(
-                {
-                    "qry_tp": "0",
-                    "dmst_stex_tp": "KRX",
-                },
-                indent=4,
-                ensure_ascii=False,
-            )
-        )
 
         self.authenticate_button = QPushButton("Get Access Token")
         self.authenticate_button.clicked.connect(self._authenticate)
@@ -397,67 +623,18 @@ class Stage1Window(QMainWindow):
         self.fetch_button.clicked.connect(self._fetch_balance)
 
         self.hashkey_checkbox = QCheckBox("Include hashkey header (if required)")
-        self.hashkey_checkbox.setChecked(False)
         self.hashkey_checkbox.stateChanged.connect(self._toggle_hashkey)
 
-        self.summary_labels: Dict[str, QLabel] = {
-            "account_name": QLabel("-"),
-            "branch_name": QLabel("-"),
-            "d2_deposit": QLabel("-"),
-            "total_evaluation": QLabel("-"),
-            "total_purchase": QLabel("-"),
-            "deposit_assets": QLabel("-"),
-            "total_profit_loss": QLabel("-"),
-            "total_profit_loss_rate": QLabel("-"),
-            "daily_profit_loss": QLabel("-"),
-            "daily_profit_loss_rate": QLabel("-"),
-        }
-
-        summary_grid = QGridLayout()
-        summary_grid.addWidget(QLabel("Account Name"), 0, 0)
-        summary_grid.addWidget(self.summary_labels["account_name"], 0, 1)
-        summary_grid.addWidget(QLabel("Branch"), 0, 2)
-        summary_grid.addWidget(self.summary_labels["branch_name"], 0, 3)
-
-        summary_grid.addWidget(QLabel("D+2 Deposit"), 1, 0)
-        summary_grid.addWidget(self.summary_labels["d2_deposit"], 1, 1)
-        summary_grid.addWidget(QLabel("Deposit Assets"), 1, 2)
-        summary_grid.addWidget(self.summary_labels["deposit_assets"], 1, 3)
-
-        summary_grid.addWidget(QLabel("Total Evaluation"), 2, 0)
-        summary_grid.addWidget(self.summary_labels["total_evaluation"], 2, 1)
-        summary_grid.addWidget(QLabel("Total Purchase"), 2, 2)
-        summary_grid.addWidget(self.summary_labels["total_purchase"], 2, 3)
-
-        summary_grid.addWidget(QLabel("Total P/L"), 3, 0)
-        summary_grid.addWidget(self.summary_labels["total_profit_loss"], 3, 1)
-        summary_grid.addWidget(QLabel("Total P/L %"), 3, 2)
-        summary_grid.addWidget(self.summary_labels["total_profit_loss_rate"], 3, 3)
-
-        summary_grid.addWidget(QLabel("Today's P/L"), 4, 0)
-        summary_grid.addWidget(self.summary_labels["daily_profit_loss"], 4, 1)
-        summary_grid.addWidget(QLabel("Today's P/L %"), 4, 2)
-        summary_grid.addWidget(self.summary_labels["daily_profit_loss_rate"], 4, 3)
-
+        self.summary_layout = QGridLayout()
         summary_box = QGroupBox("Account Summary")
-        summary_box.setLayout(summary_grid)
+        summary_box.setLayout(self.summary_layout)
+        self._set_summary_rows([])
 
-        self.holdings_table = QTableWidget(0, 9)
-        self.holdings_table.setHorizontalHeaderLabels(
-            [
-                "Symbol",
-                "Name",
-                "Quantity",
-                "Purchase Amount",
-                "Evaluation Amount",
-                "Average Price",
-                "Current Price",
-                "Profit/Loss",
-                "Profit/Loss %",
-            ]
-        )
-        self.holdings_table.horizontalHeader().setStretchLastSection(True)
+        self.holdings_table = QTableWidget()
         self.holdings_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.holdings_table.horizontalHeader().setStretchLastSection(True)
+        self.current_columns: List[str] = []
+        self._configure_holdings_table(self.DOMESTIC_COLUMNS)
 
         self.raw_output = QTextEdit()
         self.raw_output.setReadOnly(True)
@@ -465,6 +642,7 @@ class Stage1Window(QMainWindow):
 
         form_layout = QFormLayout()
         form_layout.addRow("Mode", self.mode_combo)
+        form_layout.addRow("Data Type", self.data_type_combo)
         form_layout.addRow("App Key", self.appkey_input)
         form_layout.addRow("Secret Key", self.secret_input)
         form_layout.addRow("Endpoint", self.endpoint_input)
@@ -474,10 +652,10 @@ class Stage1Window(QMainWindow):
         form_widget = QWidget()
         form_widget.setLayout(form_layout)
 
-        button_row = QGridLayout()
-        button_row.addWidget(self.authenticate_button, 0, 0)
-        button_row.addWidget(self.fetch_button, 0, 1)
-        button_row.addWidget(self.hashkey_checkbox, 1, 0, 1, 2)
+        button_layout = QGridLayout()
+        button_layout.addWidget(self.authenticate_button, 0, 0)
+        button_layout.addWidget(self.fetch_button, 0, 1)
+        button_layout.addWidget(self.hashkey_checkbox, 1, 0, 1, 2)
 
         payload_box = QGroupBox("Request Payload (JSON)")
         payload_layout = QVBoxLayout()
@@ -487,7 +665,7 @@ class Stage1Window(QMainWindow):
         control_box = QGroupBox("Configuration")
         control_layout = QVBoxLayout()
         control_layout.addWidget(form_widget)
-        control_layout.addLayout(button_row)
+        control_layout.addLayout(button_layout)
         control_layout.addWidget(payload_box)
         control_box.setLayout(control_layout)
 
@@ -502,21 +680,92 @@ class Stage1Window(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        self.client = KiwoomRestClient(
-            mode=self.mode_combo.currentText(), require_hashkey=self.hashkey_checkbox.isChecked()
-        )
+        self.current_data_type = self.DATA_TYPES[0]
+        self._load_config(self.current_data_type)
+        self._create_client()
 
-    def _mode_changed(self, mode: str) -> None:
-        self.client = KiwoomRestClient(mode=mode, require_hashkey=self.hashkey_checkbox.isChecked())
+    def _create_client(self) -> None:
+        require_hashkey = self.hashkey_checkbox.isChecked() and self._is_domestic_selected()
+        self.client = KiwoomRestClient(mode=self.mode_combo.currentText(), require_hashkey=require_hashkey)
         if self.current_appkey or self.current_secret:
             self.client.set_credentials(self.current_appkey, self.current_secret)
+
+    def _is_domestic_selected(self) -> bool:
+        return self.current_data_type == "Domestic Stocks"
+
+    def _save_current_config(self, data_type: str) -> None:
+        self.saved_configs[data_type] = {
+            "endpoint": self.endpoint_input.text().strip(),
+            "api_id": self.api_id_input.text().strip(),
+            "tr_id": self.tr_header_input.text().strip(),
+            "custtype": self.custtype_input.text().strip() or "P",
+            "payload": self.payload_input.toPlainText(),
+            "hashkey": self.hashkey_checkbox.isChecked() if data_type == "Domestic Stocks" else False,
+        }
+
+    def _load_config(self, data_type: str) -> None:
+        config = self.saved_configs[data_type]
+        self.endpoint_input.setText(config.get("endpoint", ""))
+        self.api_id_input.setText(config.get("api_id", ""))
+        self.tr_header_input.setText(config.get("tr_id", ""))
+        self.custtype_input.setText(config.get("custtype", "P"))
+        self.payload_input.setPlainText(config.get("payload", "{}"))
+
+        is_domestic = data_type == "Domestic Stocks"
+        self.hashkey_checkbox.blockSignals(True)
+        self.hashkey_checkbox.setEnabled(is_domestic)
+        self.hashkey_checkbox.setChecked(config.get("hashkey", False) if is_domestic else False)
+        self.hashkey_checkbox.blockSignals(False)
+        if self.client:
+            self.client.set_hashkey_required(self.hashkey_checkbox.isChecked() and is_domestic)
+
+        columns = self.DOMESTIC_COLUMNS if is_domestic else self.OVERSEAS_COLUMNS
+        self._configure_holdings_table(columns)
+        self._set_summary_rows([])
+
+    def _configure_holdings_table(self, columns: List[str]) -> None:
+        self.current_columns = columns
+        self.holdings_table.clear()
+        self.holdings_table.setColumnCount(len(columns))
+        self.holdings_table.setHorizontalHeaderLabels(columns)
+        self.holdings_table.setRowCount(0)
+        self.holdings_table.horizontalHeader().setStretchLastSection(True)
+
+    def _set_summary_rows(self, rows: List[Tuple[str, str]]) -> None:
+        while self.summary_layout.count():
+            item = self.summary_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for index, (label_text, value_text) in enumerate(rows):
+            row = index // 2
+            column = (index % 2) * 2
+            self.summary_layout.addWidget(QLabel(label_text), row, column)
+            self.summary_layout.addWidget(QLabel(value_text), row, column + 1)
+
+    def _mode_changed(self, mode: str) -> None:
+        self._create_client()
         if mode == "mock":
             self.raw_output.setPlainText("Running in mock mode. Real network calls are disabled.")
         else:
             self.raw_output.clear()
 
+    def _data_type_changed(self, new_type: str) -> None:
+        self._save_current_config(self.current_data_type)
+        self.current_data_type = new_type
+        self._load_config(new_type)
+        if self.client:
+            self.client.set_hashkey_required(self.hashkey_checkbox.isChecked() and self._is_domestic_selected())
+        if self.mode_combo.currentText() == "mock":
+            self.raw_output.setPlainText("Running in mock mode. Real network calls are disabled.")
+        else:
+            self.raw_output.clear()
+
     def _toggle_hashkey(self) -> None:
-        self.client.set_hashkey_required(self.hashkey_checkbox.isChecked())
+        checked = self.hashkey_checkbox.isChecked()
+        self.saved_configs[self.current_data_type]["hashkey"] = checked if self._is_domestic_selected() else False
+        if self.client:
+            self.client.set_hashkey_required(checked and self._is_domestic_selected())
 
     def _authenticate(self) -> None:
         appkey = self.appkey_input.text().strip()
@@ -527,9 +776,12 @@ class Stage1Window(QMainWindow):
 
         self.current_appkey = appkey
         self.current_secret = secret
-        self.client.set_credentials(appkey, secret)
+        if not self.client:
+            self._create_client()
+        if self.client:
+            self.client.set_credentials(appkey, secret)
 
-        if self.client.mode == "mock":
+        if self.mode_combo.currentText() == "mock":
             QMessageBox.information(self, "Mock Mode", "Mock mode does not require authentication.")
             return
 
@@ -544,6 +796,8 @@ class Stage1Window(QMainWindow):
         self.raw_output.setPlainText(f"Access token acquired: {token[:6]}... (hidden)")
 
     def _fetch_balance(self) -> None:
+        self._save_current_config(self.current_data_type)
+
         try:
             payload = json.loads(self.payload_input.toPlainText())
             if not isinstance(payload, dict):
@@ -557,56 +811,80 @@ class Stage1Window(QMainWindow):
 
         endpoint = self.endpoint_input.text().strip()
         api_id = self.api_id_input.text().strip()
-        tr_id_header = self.tr_header_input.text().strip() or None
-        custtype = self.custtype_input.text().strip().upper() or "P"
-        if len(custtype) > 1:
-            custtype = custtype[0]
+        tr_id = self.tr_header_input.text().strip() or None
+        custtype = self.custtype_input.text().strip() or "P"
 
         if not endpoint.startswith("/"):
             QMessageBox.warning(self, "Invalid Endpoint", "Endpoint should start with '/' (e.g. /api/...).")
             return
         if not api_id:
-            QMessageBox.warning(self, "Missing API ID", "Enter the api-id value (e.g. kt00004).")
+            QMessageBox.warning(self, "Missing API ID", "Enter the api-id value for the TR you are calling.")
             return
+
+        if not self.client:
+            self._create_client()
 
         try:
-            summary, holdings, raw = self.client.fetch_account_balance(
-                payload,
-                endpoint=endpoint,
-                api_id=api_id,
-                tr_id=tr_id_header,
-                custtype=custtype,
-            )
+            if self._is_domestic_selected():
+                summary, holdings, raw = self.client.fetch_account_balance(
+                    payload,
+                    endpoint=endpoint,
+                    api_id=api_id,
+                    tr_id=tr_id,
+                    custtype=custtype,
+                )
+                self._update_domestic_summary(summary)
+                self._update_domestic_holdings(holdings)
+            else:
+                summary, holdings, raw = self.client.fetch_overseas_balance(
+                    payload,
+                    endpoint=endpoint,
+                    api_id=api_id,
+                    tr_id=tr_id,
+                    custtype=custtype,
+                )
+                self._update_overseas_summary(summary)
+                self._update_overseas_holdings(holdings)
         except Exception as exc:
             QMessageBox.critical(self, "Request Failed", str(exc))
-            warning = self.client.last_hashkey_error
-            text = str(exc)
+            warning = self.client.last_hashkey_error if self.client else None
+            message = str(exc)
             if warning:
-                text += f"\n\n[Hashkey warning] {warning}"
-            self.raw_output.setPlainText(text)
+                message += f"\n\n[Hashkey warning] {warning}"
+            self.raw_output.setPlainText(message)
             return
 
-        self._update_summary(summary)
-        self._update_holdings_table(holdings)
         output_text = json.dumps(raw, indent=4, ensure_ascii=False)
-        warning = self.client.last_hashkey_error
+        warning = self.client.last_hashkey_error if self.client else None
         if warning:
             output_text += f"\n\n[Hashkey warning] {warning}"
         self.raw_output.setPlainText(output_text)
 
-    def _update_summary(self, summary: AccountSummary) -> None:
-        self.summary_labels["account_name"].setText(summary.account_name or "-")
-        self.summary_labels["branch_name"].setText(summary.branch_name or "-")
-        self.summary_labels["d2_deposit"].setText(_format_currency(summary.d2_deposit))
-        self.summary_labels["deposit_assets"].setText(_format_currency(summary.deposit_assets))
-        self.summary_labels["total_evaluation"].setText(_format_currency(summary.total_evaluation))
-        self.summary_labels["total_purchase"].setText(_format_currency(summary.total_purchase))
-        self.summary_labels["total_profit_loss"].setText(_format_currency(summary.total_profit_loss))
-        self.summary_labels["total_profit_loss_rate"].setText(_format_rate(summary.total_profit_loss_rate))
-        self.summary_labels["daily_profit_loss"].setText(_format_currency(summary.daily_profit_loss))
-        self.summary_labels["daily_profit_loss_rate"].setText(_format_rate(summary.daily_profit_loss_rate))
+    def _update_domestic_summary(self, summary: AccountSummary) -> None:
+        rows = [
+            ("Account Name", summary.account_name or "-"),
+            ("Branch", summary.branch_name or "-"),
+            ("D+2 Deposit", _format_currency(summary.d2_deposit)),
+            ("Deposit Assets", _format_currency(summary.deposit_assets)),
+            ("Total Evaluation", _format_currency(summary.total_evaluation)),
+            ("Total Purchase", _format_currency(summary.total_purchase)),
+            ("Total P/L", _format_currency(summary.total_profit_loss)),
+            ("Total P/L %", _format_rate(summary.total_profit_loss_rate)),
+            ("Today's P/L", _format_currency(summary.daily_profit_loss)),
+            ("Today's P/L %", _format_rate(summary.daily_profit_loss_rate)),
+        ]
+        self._set_summary_rows(rows)
 
-    def _update_holdings_table(self, holdings: List[AccountHolding]) -> None:
+    def _update_overseas_summary(self, summary: OverseasSummary) -> None:
+        rows = [
+            ("KRW Estimated Asset", _format_currency(summary.krw_estimated_asset)),
+            ("Evaluation Amount", _format_currency(summary.evaluation_amount)),
+            ("Purchase Amount", _format_currency(summary.purchase_amount)),
+        ]
+        self._set_summary_rows(rows)
+
+    def _update_domestic_holdings(self, holdings: List[AccountHolding]) -> None:
+        self._configure_holdings_table(self.DOMESTIC_COLUMNS)
         self.holdings_table.setRowCount(len(holdings))
         for row, item in enumerate(holdings):
             values = [
@@ -626,6 +904,24 @@ class Stage1Window(QMainWindow):
                     cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.holdings_table.setItem(row, column, cell)
 
+    def _update_overseas_holdings(self, holdings: List[OverseasHolding]) -> None:
+        self._configure_holdings_table(self.OVERSEAS_COLUMNS)
+        self.holdings_table.setRowCount(len(holdings))
+        for row, item in enumerate(holdings):
+            values = [
+                item.symbol,
+                item.name,
+                _format_quantity(item.quantity),
+                _format_currency(item.purchase_amount),
+                _format_currency(item.evaluation_amount),
+                _format_price(item.average_price),
+                _format_price(item.current_price),
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if column >= 2:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.holdings_table.setItem(row, column, cell)
 
 def run() -> None:
     app = QApplication(sys.argv)
