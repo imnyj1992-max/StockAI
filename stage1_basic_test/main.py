@@ -88,26 +88,19 @@ class AccountHolding:
     profit_loss_rate: float
 
 
-@dataclass
-class OverseasSummary:
-    krw_estimated_asset: float
-    evaluation_amount: float
-    purchase_amount: float
-
-
-@dataclass
-class OverseasHolding:
-    symbol: str
-    name: str
-    quantity: float
-    purchase_amount: float
-    evaluation_amount: float
-    average_price: float
-    current_price: float
+@dataclass(frozen=True)
+class TrPreset:
+    label: str
+    endpoint: str
+    api_id: str
+    tr_id: str
+    custtype: str = "P"
+    payload: Optional[str] = None
+    requires_hashkey: bool = False
 
 
 class KiwoomRestClient:
-    """Minimal Kiwoom REST client supporting domestic and overseas balance TRs."""
+    """Minimal Kiwoom REST client supporting domestic balance TRs."""
 
     def __init__(self, *, mode: str = "real", require_hashkey: bool = False) -> None:
         if mode not in {"real", "mock"}:
@@ -180,41 +173,6 @@ class KiwoomRestClient:
             raise RuntimeError("Account balance request failed.")
 
         summary, holdings = self._parse_account_balance(response)
-        return summary, holdings, response
-
-    def fetch_overseas_balance(
-        self,
-        payload: Dict[str, Any],
-        *,
-        endpoint: str,
-        api_id: str,
-        tr_id: Optional[str] = None,
-        custtype: str = "P",
-        cont_yn: str = "N",
-        next_key: str = "",
-    ) -> Tuple[OverseasSummary, List[OverseasHolding], Dict[str, Any]]:
-        self.last_hashkey_error = None
-        if self.mode == "mock":
-            summary, holdings, raw = self._mock_overseas_balance()
-            return summary, holdings, raw
-
-        if not self._access_token:
-            raise RuntimeError("No access token. Authenticate first.")
-
-        response = self._post(
-            endpoint,
-            payload,
-            token=self._access_token,
-            api_id=api_id,
-            tr_id=tr_id,
-            custtype=custtype,
-            cont_yn=cont_yn,
-            next_key=next_key,
-        )
-        if response is None:
-            raise RuntimeError("Overseas balance request failed.")
-
-        summary, holdings = self._parse_overseas_balance(response)
         return summary, holdings, response
 
     def _post(
@@ -367,76 +325,6 @@ class KiwoomRestClient:
 
         return summary, holdings
 
-    def _parse_overseas_balance(self, payload: Dict[str, Any]) -> Tuple[OverseasSummary, List[OverseasHolding]]:
-        summary_source = self._find_first_mapping(
-            payload,
-            ["output", "output1", "summary", "data", "result"],
-        )
-
-        summary = OverseasSummary(
-            krw_estimated_asset=_parse_decimal(
-                self._find_first(
-                    summary_source,
-                    [
-                        "krw_estimated_asset",
-                        "ovrs_kor_estm_amt",
-                        "ovrs_tot_estm_amt",
-                        "kor_tot_evlt_amt",
-                        "ovrs_kor_evlt_amt",
-                    ],
-                )
-            ),
-            evaluation_amount=_parse_decimal(
-                self._find_first(
-                    summary_source,
-                    ["evaluation_amount", "ovrs_evlt_amt", "ovrs_pdls_amt", "evlt_amt"],
-                )
-            ),
-            purchase_amount=_parse_decimal(
-                self._find_first(
-                    summary_source,
-                    ["purchase_amount", "ovrs_buy_amt", "ovrs_pdls_buy_amt", "buy_amt"],
-                )
-            ),
-        )
-
-        holdings_source = self._find_first_list(
-            payload,
-            ["output1", "output2", "stocks", "holdings", "items", "result_list"],
-        )
-
-        holdings: List[OverseasHolding] = []
-        for entry in holdings_source:
-            symbol = str(self._find_first(entry, ["stk_cd", "ovrs_item_cd", "code", "symbol"]) or "").strip()
-            if symbol.startswith("A") and len(symbol) > 1:
-                symbol = symbol[1:]
-            holdings.append(
-                OverseasHolding(
-                    symbol=symbol or "-",
-                    name=str(
-                        self._find_first(entry, ["stk_nm", "ovrs_item_nm", "name", "item_name"]) or "-"
-                    ).strip()
-                    or "-",
-                    quantity=_parse_decimal(
-                        self._find_first(entry, ["rmnd_qty", "ovrs_cblc_qty", "qty", "hold_qty"])
-                    ),
-                    purchase_amount=_parse_decimal(
-                        self._find_first(entry, ["pur_amt", "ovrs_buamt", "buy_amt", "pchs_amt"])
-                    ),
-                    evaluation_amount=_parse_decimal(
-                        self._find_first(entry, ["evlt_amt", "ovrs_evlt_amt", "eval_amt", "evlt_amt"])
-                    ),
-                    average_price=_parse_decimal(
-                        self._find_first(entry, ["avg_prc", "ovrs_avg_prc", "avg_price", "avg_prc"])
-                    ),
-                    current_price=_parse_decimal(
-                        self._find_first(entry, ["cur_prc", "ovrs_now_prc", "prpr", "current_price"])
-                    ),
-                )
-            )
-
-        return summary, holdings
-
     def _mock_account_balance(self) -> Tuple[AccountSummary, List[AccountHolding], Dict[str, Any]]:
         sample_response = {
             "acnt_nm": "Sample User",
@@ -468,63 +356,7 @@ class KiwoomRestClient:
         summary, holdings = self._parse_account_balance(sample_response)
         return summary, holdings, sample_response
 
-    def _mock_overseas_balance(self) -> Tuple[OverseasSummary, List[OverseasHolding], Dict[str, Any]]:
-        sample_response = {
-            "krw_estimated_asset": "00000052350000",
-            "ovrs_evlt_amt": "00000049800000",
-            "ovrs_buy_amt": "00000045900000",
-            "holdings": [
-                {
-                    "stk_cd": "AAPL",
-                    "stk_nm": "Apple",
-                    "rmnd_qty": "30",
-                    "avg_prc": "150000",
-                    "cur_prc": "170000",
-                    "evlt_amt": "5100000",
-                    "pur_amt": "4500000",
-                },
-                {
-                    "stk_cd": "TSLA",
-                    "stk_nm": "Tesla",
-                    "rmnd_qty": "10",
-                    "avg_prc": "780000",
-                    "cur_prc": "690000",
-                    "evlt_amt": "6900000",
-                    "pur_amt": "7800000",
-                },
-            ],
-        }
-        summary, holdings = self._parse_overseas_balance(sample_response)
-        return summary, holdings, sample_response
-
-    @staticmethod
-    def _find_first_mapping(payload: Dict[str, Any], candidates: List[str]) -> Dict[str, Any]:
-        for key in candidates:
-            value = payload.get(key)
-            if isinstance(value, dict):
-                return value
-        return payload
-
-    @staticmethod
-    def _find_first(source: Optional[Dict[str, Any]], candidates: List[str]) -> Any:
-        if not source:
-            return None
-        for key in candidates:
-            if key in source:
-                return source[key]
-        return None
-
-    @staticmethod
-    def _find_first_list(payload: Dict[str, Any], candidates: List[str]) -> List[Dict[str, Any]]:
-        for key in candidates:
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-        return []
-
-
 class Stage1Window(QMainWindow):
-    DATA_TYPES = ("Domestic Stocks", "Overseas Stocks")
     DOMESTIC_COLUMNS = [
         "Symbol",
         "Name",
@@ -535,15 +367,6 @@ class Stage1Window(QMainWindow):
         "Current Price",
         "Profit/Loss",
         "Profit/Loss %",
-    ]
-    OVERSEAS_COLUMNS = [
-        "Symbol",
-        "Name",
-        "Quantity",
-        "Purchase Amount",
-        "Evaluation Amount",
-        "Average Price",
-        "Current Price",
     ]
 
     def __init__(self) -> None:
@@ -563,46 +386,35 @@ class Stage1Window(QMainWindow):
             indent=4,
             ensure_ascii=False,
         )
-        overseas_payload = json.dumps(
-            {
-                "CANO": "00000000",
-                "ACNT_PRDT_CD": "01",
-                "OVRS_EXCG_CD": "NASD",
-                "TR_CCY_CD": "USD",
-            },
-            indent=4,
-            ensure_ascii=False,
-        )
-
-        self.saved_configs: Dict[str, Dict[str, Any]] = {
-            "Domestic Stocks": {
-                "endpoint": "/api/dostk/acnt",
-                "api_id": "kt00004",
-                "tr_id": "TTTS3004R",
-                "custtype": "P",
-                "payload": domestic_payload,
-                "hashkey": False,
-            },
-            "Overseas Stocks": {
-                "endpoint": "/api/overseas/balance",
-                "api_id": "",
-                "tr_id": "",
-                "custtype": "P",
-                "payload": overseas_payload,
-                "hashkey": False,
-            },
+        self.saved_config: Dict[str, Any] = {
+            "endpoint": "/api/dostk/acnt",
+            "api_id": "kt00004",
+            "tr_id": "TTTS3004R",
+            "custtype": "P",
+            "payload": domestic_payload,
+            "hashkey": False,
         }
+        self.tr_presets: List[TrPreset] = [
+            TrPreset(
+                label="\uad6d\ub0b4 \uc8fc\uc2dd \uc794\uace0\uc870\ud68c (TTTS3004R)",
+                endpoint="/api/dostk/acnt",
+                api_id="kt00004",
+                tr_id="TTTS3004R",
+                custtype="P",
+                payload=domestic_payload,
+            )
+        ]
+        self.selected_preset_label: Optional[str] = None
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["real", "mock"])
         self.mode_combo.currentTextChanged.connect(self._mode_changed)
 
-        self.data_type_combo = QComboBox()
-        self.data_type_combo.addItems(self.DATA_TYPES)
-        self.data_type_combo.currentTextChanged.connect(self._data_type_changed)
+        self.preset_combo = QComboBox()
+        self.preset_combo.currentIndexChanged.connect(self._preset_changed)
 
-        self.appkey_input = QLineEdit("eNfziSc7ibOOl8tqrI8-K-sjl9o3oKI6QpzaZANWopM")
-        self.secret_input = QLineEdit("Ei1bzCY-vO2cY4WMTty8-fJx0JmvDFJuYS7q4PUDQgs")
+        self.appkey_input = QLineEdit()
+        self.secret_input = QLineEdit()
         self.secret_input.setEchoMode(QLineEdit.Password)
 
         self.endpoint_input = QLineEdit()
@@ -642,7 +454,7 @@ class Stage1Window(QMainWindow):
 
         form_layout = QFormLayout()
         form_layout.addRow("Mode", self.mode_combo)
-        form_layout.addRow("Data Type", self.data_type_combo)
+        form_layout.addRow("TR Preset", self.preset_combo)
         form_layout.addRow("App Key", self.appkey_input)
         form_layout.addRow("Secret Key", self.secret_input)
         form_layout.addRow("Endpoint", self.endpoint_input)
@@ -680,48 +492,78 @@ class Stage1Window(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        self.current_data_type = self.DATA_TYPES[0]
-        self._load_config(self.current_data_type)
+        self._load_config()
+        self._refresh_preset_combo()
         self._create_client()
 
     def _create_client(self) -> None:
-        require_hashkey = self.hashkey_checkbox.isChecked() and self._is_domestic_selected()
+        require_hashkey = self.hashkey_checkbox.isChecked()
         self.client = KiwoomRestClient(mode=self.mode_combo.currentText(), require_hashkey=require_hashkey)
         if self.current_appkey or self.current_secret:
             self.client.set_credentials(self.current_appkey, self.current_secret)
 
-    def _is_domestic_selected(self) -> bool:
-        return self.current_data_type == "Domestic Stocks"
-
-    def _save_current_config(self, data_type: str) -> None:
-        self.saved_configs[data_type] = {
+    def _save_current_config(self) -> None:
+        self.saved_config = {
             "endpoint": self.endpoint_input.text().strip(),
             "api_id": self.api_id_input.text().strip(),
             "tr_id": self.tr_header_input.text().strip(),
             "custtype": self.custtype_input.text().strip() or "P",
             "payload": self.payload_input.toPlainText(),
-            "hashkey": self.hashkey_checkbox.isChecked() if data_type == "Domestic Stocks" else False,
+            "hashkey": self.hashkey_checkbox.isChecked(),
         }
 
-    def _load_config(self, data_type: str) -> None:
-        config = self.saved_configs[data_type]
+    def _load_config(self) -> None:
+        config = self.saved_config
         self.endpoint_input.setText(config.get("endpoint", ""))
         self.api_id_input.setText(config.get("api_id", ""))
         self.tr_header_input.setText(config.get("tr_id", ""))
         self.custtype_input.setText(config.get("custtype", "P"))
         self.payload_input.setPlainText(config.get("payload", "{}"))
 
-        is_domestic = data_type == "Domestic Stocks"
         self.hashkey_checkbox.blockSignals(True)
-        self.hashkey_checkbox.setEnabled(is_domestic)
-        self.hashkey_checkbox.setChecked(config.get("hashkey", False) if is_domestic else False)
+        self.hashkey_checkbox.setEnabled(True)
+        self.hashkey_checkbox.setChecked(config.get("hashkey", False))
         self.hashkey_checkbox.blockSignals(False)
         if self.client:
-            self.client.set_hashkey_required(self.hashkey_checkbox.isChecked() and is_domestic)
+            self.client.set_hashkey_required(self.hashkey_checkbox.isChecked())
 
-        columns = self.DOMESTIC_COLUMNS if is_domestic else self.OVERSEAS_COLUMNS
-        self._configure_holdings_table(columns)
+        self._configure_holdings_table(self.DOMESTIC_COLUMNS)
         self._set_summary_rows([])
+
+    def _refresh_preset_combo(self) -> None:
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("\uc9c1\uc811 \uc120\ud0dd (\uc218\ub3d9 \uc785\ub825)", None)
+        for preset in self.tr_presets:
+            self.preset_combo.addItem(preset.label, preset)
+        if self.selected_preset_label:
+            for index in range(1, self.preset_combo.count()):
+                if self.preset_combo.itemText(index) == self.selected_preset_label:
+                    self.preset_combo.setCurrentIndex(index)
+                    break
+            else:
+                self.preset_combo.setCurrentIndex(0)
+        else:
+            self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+
+    def _apply_preset(self, preset: TrPreset) -> None:
+        self.endpoint_input.setText(preset.endpoint)
+        self.api_id_input.setText(preset.api_id)
+        self.tr_header_input.setText(preset.tr_id)
+        self.custtype_input.setText(preset.custtype or "P")
+        if preset.payload:
+            self.payload_input.setPlainText(preset.payload)
+        self.hashkey_checkbox.setChecked(preset.requires_hashkey)
+        self._save_current_config()
+
+    def _preset_changed(self, index: int) -> None:
+        data = self.preset_combo.itemData(index)
+        if not isinstance(data, TrPreset):
+            self.selected_preset_label = None
+            return
+        self.selected_preset_label = data.label
+        self._apply_preset(data)
 
     def _configure_holdings_table(self, columns: List[str]) -> None:
         self.current_columns = columns
@@ -750,22 +592,11 @@ class Stage1Window(QMainWindow):
         else:
             self.raw_output.clear()
 
-    def _data_type_changed(self, new_type: str) -> None:
-        self._save_current_config(self.current_data_type)
-        self.current_data_type = new_type
-        self._load_config(new_type)
-        if self.client:
-            self.client.set_hashkey_required(self.hashkey_checkbox.isChecked() and self._is_domestic_selected())
-        if self.mode_combo.currentText() == "mock":
-            self.raw_output.setPlainText("Running in mock mode. Real network calls are disabled.")
-        else:
-            self.raw_output.clear()
-
     def _toggle_hashkey(self) -> None:
         checked = self.hashkey_checkbox.isChecked()
-        self.saved_configs[self.current_data_type]["hashkey"] = checked if self._is_domestic_selected() else False
+        self.saved_config["hashkey"] = checked
         if self.client:
-            self.client.set_hashkey_required(checked and self._is_domestic_selected())
+            self.client.set_hashkey_required(checked)
 
     def _authenticate(self) -> None:
         appkey = self.appkey_input.text().strip()
@@ -796,7 +627,7 @@ class Stage1Window(QMainWindow):
         self.raw_output.setPlainText(f"Access token acquired: {token[:6]}... (hidden)")
 
     def _fetch_balance(self) -> None:
-        self._save_current_config(self.current_data_type)
+        self._save_current_config()
 
         try:
             payload = json.loads(self.payload_input.toPlainText())
@@ -825,26 +656,15 @@ class Stage1Window(QMainWindow):
             self._create_client()
 
         try:
-            if self._is_domestic_selected():
-                summary, holdings, raw = self.client.fetch_account_balance(
-                    payload,
-                    endpoint=endpoint,
-                    api_id=api_id,
-                    tr_id=tr_id,
-                    custtype=custtype,
-                )
-                self._update_domestic_summary(summary)
-                self._update_domestic_holdings(holdings)
-            else:
-                summary, holdings, raw = self.client.fetch_overseas_balance(
-                    payload,
-                    endpoint=endpoint,
-                    api_id=api_id,
-                    tr_id=tr_id,
-                    custtype=custtype,
-                )
-                self._update_overseas_summary(summary)
-                self._update_overseas_holdings(holdings)
+            summary, holdings, raw = self.client.fetch_account_balance(
+                payload,
+                endpoint=endpoint,
+                api_id=api_id,
+                tr_id=tr_id,
+                custtype=custtype,
+            )
+            self._update_domestic_summary(summary)
+            self._update_domestic_holdings(holdings)
         except Exception as exc:
             QMessageBox.critical(self, "Request Failed", str(exc))
             warning = self.client.last_hashkey_error if self.client else None
@@ -875,14 +695,6 @@ class Stage1Window(QMainWindow):
         ]
         self._set_summary_rows(rows)
 
-    def _update_overseas_summary(self, summary: OverseasSummary) -> None:
-        rows = [
-            ("KRW Estimated Asset", _format_currency(summary.krw_estimated_asset)),
-            ("Evaluation Amount", _format_currency(summary.evaluation_amount)),
-            ("Purchase Amount", _format_currency(summary.purchase_amount)),
-        ]
-        self._set_summary_rows(rows)
-
     def _update_domestic_holdings(self, holdings: List[AccountHolding]) -> None:
         self._configure_holdings_table(self.DOMESTIC_COLUMNS)
         self.holdings_table.setRowCount(len(holdings))
@@ -897,25 +709,6 @@ class Stage1Window(QMainWindow):
                 _format_price(item.current_price),
                 _format_currency(item.profit_loss),
                 _format_rate(item.profit_loss_rate),
-            ]
-            for column, value in enumerate(values):
-                cell = QTableWidgetItem(value)
-                if column >= 2:
-                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.holdings_table.setItem(row, column, cell)
-
-    def _update_overseas_holdings(self, holdings: List[OverseasHolding]) -> None:
-        self._configure_holdings_table(self.OVERSEAS_COLUMNS)
-        self.holdings_table.setRowCount(len(holdings))
-        for row, item in enumerate(holdings):
-            values = [
-                item.symbol,
-                item.name,
-                _format_quantity(item.quantity),
-                _format_currency(item.purchase_amount),
-                _format_currency(item.evaluation_amount),
-                _format_price(item.average_price),
-                _format_price(item.current_price),
             ]
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
